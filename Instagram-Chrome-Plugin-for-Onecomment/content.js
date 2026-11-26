@@ -41,16 +41,45 @@
     return true;
   }
 
+  let disposed = false;
+
+  function isExtensionContextValid() {
+    try {
+      return !disposed && typeof chrome !== 'undefined' && Boolean(chrome.runtime && chrome.runtime.id);
+    } catch {
+      return false;
+    }
+  }
+
+  function cleanup() {
+    if (disposed) return;
+    disposed = true;
+    if (rescanTimer) {
+      clearInterval(rescanTimer);
+      rescanTimer = null;
+    }
+    if (flushTimer) {
+      clearTimeout(flushTimer);
+      flushTimer = null;
+    }
+    pendingComments.length = 0;
+    detachObserver();
+  }
+
   function flushPending() {
     flushTimer = null;
+    if (!isExtensionContextValid()) {
+      cleanup();
+      return;
+    }
     if (!settings.enabled || pendingComments.length === 0) {
       pendingComments.length = 0;
       return;
     }
 
     const batch = pendingComments.splice(0, 20);
-    chrome.runtime
-      .sendMessage({
+    try {
+      const maybePromise = chrome.runtime.sendMessage({
         type: 'SEND_COMMENTS',
         payload: {
           platform: 'instagram',
@@ -58,10 +87,16 @@
           sourceUrl: location.href,
           comments: batch,
         },
-      })
-      .catch(() => {
-        // 拡張機能リロード直後などは無視
       });
+      if (maybePromise && typeof maybePromise.catch === 'function') {
+        maybePromise.catch(() => {
+          // 拡張機能リロード直後などは無視
+        });
+      }
+    } catch {
+      cleanup();
+      return;
+    }
 
     if (pendingComments.length > 0) {
       scheduleFlush();
@@ -150,6 +185,11 @@
   }
 
   function checkAndAttach() {
+    if (!isExtensionContextValid()) {
+      cleanup();
+      return;
+    }
+
     if (location.href !== lastUrl) {
       lastUrl = location.href;
       detachObserver();
@@ -216,9 +256,5 @@
   });
 
   rescanTimer = setInterval(checkAndAttach, 2000);
-  window.addEventListener('beforeunload', () => {
-    if (rescanTimer) clearInterval(rescanTimer);
-    if (flushTimer) clearTimeout(flushTimer);
-    detachObserver();
-  });
+  window.addEventListener('beforeunload', cleanup);
 })();

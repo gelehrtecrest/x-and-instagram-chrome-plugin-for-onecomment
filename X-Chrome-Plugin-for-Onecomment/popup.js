@@ -12,6 +12,7 @@ const testSendBtn = document.getElementById('testSendBtn');
 const refreshBtn = document.getElementById('refreshBtn');
 const openOptionsBtn = document.getElementById('openOptionsBtn');
 const resetStatsBtn = document.getElementById('resetStatsBtn');
+const copyDiagBtn = document.getElementById('copyDiagBtn');
 
 function setBadge(el, text, cls) {
   el.textContent = text;
@@ -116,11 +117,11 @@ async function checkActiveTab() {
     }
 
     const res = await queryTabStatusWithAutoInject(tab.id);
-    if (res && res.wsConnected && res.domFound) {
-      setBadge(tabStatus, 'チャット監視中 (WS+DOM)', 'badge-ok');
-    } else if (res && res.wsConnected) {
+    if (res && res.wsConnected) {
       setBadge(tabStatus, 'チャット監視中 (WS)', 'badge-ok');
-    } else if (res && res.containerFound) {
+    } else if (res && res.historyFetchCount > 0) {
+      setBadge(tabStatus, 'チャット監視中 (API)', 'badge-ok');
+    } else if (res && res.domFound) {
       setBadge(tabStatus, 'チャット監視中 (DOM)', 'badge-ok');
     } else if (res && res.isLivePage && !res.hookAlive) {
       setBadge(tabStatus, '要ページ再読込', 'badge-warn');
@@ -185,5 +186,25 @@ resetStatsBtn.addEventListener('click', async () => {
   await chrome.runtime.sendMessage({ type: 'RESET_STATS' });
   await loadAll();
 });
+
+if (copyDiagBtn) {
+  copyDiagBtn.addEventListener('click', async () => {
+    const orig = copyDiagBtn.textContent;
+    copyDiagBtn.textContent = '取得中...';
+    try {
+      const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+      if (!tab || !tab.id) throw new Error('タブ未検出');
+      const diag = await chrome.tabs.sendMessage(tab.id, { type: 'GET_DIAGNOSTICS' });
+      await navigator.clipboard.writeText(JSON.stringify(diag, null, 2));
+      copyDiagBtn.textContent = 'コピー完了';
+    } catch (err) {
+      copyDiagBtn.textContent = '取得失敗';
+      showTabHint(`診断取得失敗: ${(err && err.message) || '不明なエラー'}`);
+    }
+    setTimeout(() => {
+      copyDiagBtn.textContent = orig;
+    }, 1800);
+  });
+}
 
 loadAll({ recheckHealth: true });
