@@ -103,7 +103,11 @@ async function fetchBridge(pathname, { method = 'GET', body = null, settingsOver
     });
     const data = await response.json().catch(() => ({}));
     if (!response.ok) {
-      throw new Error(data.error || `HTTP ${response.status}`);
+      const detail =
+        data.error ||
+        (Array.isArray(data.errors) && data.errors.length > 0 ? data.errors[0] : '') ||
+        `HTTP ${response.status}`;
+      throw new Error(detail);
     }
     return data;
   } finally {
@@ -257,6 +261,13 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
         };
         try {
           const data = await fetchBridge('/comments', { method: 'POST', body: requestBody });
+          if (!data.ok || (data.failed && data.failed > 0)) {
+            const detail =
+              (Array.isArray(data.errors) && data.errors[0]) ||
+              data.error ||
+              'テストコメントの投入に失敗しました';
+            throw new Error(detail);
+          }
           const current = await getRuntimeState();
           const recentComments = [
             { name: testComment.name, comment: testComment.comment, timestamp: testComment.timestamp },
@@ -268,9 +279,14 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
             lastError: '',
             sentCount: (current.sentCount || 0) + (data.accepted || 0),
             recentComments,
+            lastCheckedAt: Date.now(),
           });
           sendResponse({ ok: true, data });
         } catch (err) {
+          await updateRuntimeState({
+            lastError: `テスト送信失敗: ${err.message}`,
+            lastCheckedAt: Date.now(),
+          });
           sendResponse({ ok: false, error: err.message });
         }
         break;

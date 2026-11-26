@@ -103,7 +103,11 @@ async function fetchBridge(pathname, { method = 'GET', body = null, settingsOver
     });
     const data = await response.json().catch(() => ({}));
     if (!response.ok) {
-      throw new Error(data.error || `HTTP ${response.status}`);
+      const detail =
+        data.error ||
+        (Array.isArray(data.errors) && data.errors.length > 0 ? data.errors[0] : '') ||
+        `HTTP ${response.status}`;
+      throw new Error(detail);
     }
     return data;
   } finally {
@@ -188,9 +192,32 @@ async function sendCommentsWithRetry(payload) {
   return { ok: false, error: lastErr ? lastErr.message : '不明なエラー' };
 }
 
+async function injectIntoExistingXTabs() {
+  if (!chrome.scripting || typeof chrome.scripting.executeScript !== 'function') return;
+  try {
+    const tabs = await chrome.tabs.query({
+      url: ['https://x.com/*', 'https://twitter.com/*'],
+    });
+    for (const tab of tabs) {
+      if (!tab || !tab.id) continue;
+      try {
+        await chrome.scripting.executeScript({
+          target: { tabId: tab.id },
+          files: ['selectors.js', 'content.js'],
+        });
+      } catch {
+        // 権限不足や特殊タブは無視
+      }
+    }
+  } catch {
+    // ignore
+  }
+}
+
 chrome.runtime.onInstalled.addListener(async () => {
   const settings = await getSettings();
   await chrome.storage.local.set({ settings });
+  await injectIntoExistingXTabs();
   await checkHealth();
 });
 
@@ -257,6 +284,13 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
         };
         try {
           const data = await fetchBridge('/comments', { method: 'POST', body: requestBody });
+          if (!data.ok || (data.failed && data.failed > 0)) {
+            const detail =
+              (Array.isArray(data.errors) && data.errors[0]) ||
+              data.error ||
+              'テストコメントの投入に失敗しました';
+            throw new Error(detail);
+          }
           const current = await getRuntimeState();
           const recentComments = [
             { name: testComment.name, comment: testComment.comment, timestamp: testComment.timestamp },
@@ -268,9 +302,14 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
             lastError: '',
             sentCount: (current.sentCount || 0) + (data.accepted || 0),
             recentComments,
+            lastCheckedAt: Date.now(),
           });
           sendResponse({ ok: true, data });
         } catch (err) {
+          await updateRuntimeState({
+            lastError: `テスト送信失敗: ${err.message}`,
+            lastCheckedAt: Date.now(),
+          });
           sendResponse({ ok: false, error: err.message });
         }
         break;

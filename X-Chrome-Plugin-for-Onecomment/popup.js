@@ -66,6 +66,42 @@ function renderState(settings, state) {
   }
 }
 
+function isXOriginUrl(urlString) {
+  if (typeof urlString !== 'string' || !urlString) return false;
+  try {
+    const parsed = new URL(urlString);
+    if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') return false;
+    const host = parsed.hostname.toLowerCase();
+    return host === 'x.com' || host === 'www.x.com' || host === 'twitter.com' || host === 'www.twitter.com';
+  } catch {
+    return false;
+  }
+}
+
+function showTabHint(message) {
+  if (!message) return;
+  if (errorBox.classList.contains('hidden') || !errorBox.textContent.trim()) {
+    errorBox.textContent = message;
+    errorBox.classList.remove('hidden');
+  }
+}
+
+async function queryTabStatusWithAutoInject(tabId) {
+  try {
+    return await chrome.tabs.sendMessage(tabId, { type: 'GET_TAB_STATUS' });
+  } catch (firstErr) {
+    if (!chrome.scripting || typeof chrome.scripting.executeScript !== 'function') {
+      throw firstErr;
+    }
+    await chrome.scripting.executeScript({
+      target: { tabId },
+      files: ['selectors.js', 'content.js'],
+    });
+    await new Promise((r) => setTimeout(r, 150));
+    return await chrome.tabs.sendMessage(tabId, { type: 'GET_TAB_STATUS' });
+  }
+}
+
 async function checkActiveTab() {
   try {
     const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
@@ -73,16 +109,33 @@ async function checkActiveTab() {
       setBadge(tabStatus, '対象外', 'badge-muted');
       return;
     }
-    const res = await chrome.tabs.sendMessage(tab.id, { type: 'GET_TAB_STATUS' });
-    if (res && res.containerFound) {
-      setBadge(tabStatus, 'チャット監視中', 'badge-ok');
+
+    if (tab.url && !isXOriginUrl(tab.url)) {
+      setBadge(tabStatus, 'Xページ以外', 'badge-muted');
+      return;
+    }
+
+    const res = await queryTabStatusWithAutoInject(tab.id);
+    if (res && res.wsConnected && res.domFound) {
+      setBadge(tabStatus, 'チャット監視中 (WS+DOM)', 'badge-ok');
+    } else if (res && res.wsConnected) {
+      setBadge(tabStatus, 'チャット監視中 (WS)', 'badge-ok');
+    } else if (res && res.containerFound) {
+      setBadge(tabStatus, 'チャット監視中 (DOM)', 'badge-ok');
+    } else if (res && res.isLivePage && !res.hookAlive) {
+      setBadge(tabStatus, '要ページ再読込', 'badge-warn');
+      showTabHint('X Liveのタブを F5 で再読み込みしてください（通信フックを有効化します）。');
     } else if (res && res.isLivePage) {
       setBadge(tabStatus, 'チャット欄待機中', 'badge-warn');
+      if (Array.isArray(res.wsSeenUrls) && res.wsSeenUrls.length > 0) {
+        showTabHint(`チャット通信待機中（検出WS: ${res.wsSeenUrls.join(', ')}）`);
+      }
     } else {
       setBadge(tabStatus, 'X Live以外', 'badge-muted');
     }
-  } catch {
-    setBadge(tabStatus, 'Xページ以外', 'badge-muted');
+  } catch (err) {
+    setBadge(tabStatus, 'タブ未接続', 'badge-err');
+    showTabHint(`タブとの通信に失敗しました: ${(err && err.message) || '不明なエラー'}（XタブをF5で再読み込みしてください）`);
   }
 }
 

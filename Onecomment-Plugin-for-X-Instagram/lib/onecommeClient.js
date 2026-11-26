@@ -1,7 +1,13 @@
 'use strict';
 
+const crypto = require('crypto');
 const http = require('http');
 const https = require('https');
+
+const DEFAULT_PLATFORM_COLORS = {
+  x: { r: 29, g: 155, b: 240 },
+  instagram: { r: 225, g: 48, b: 108 },
+};
 
 class OneCommeClient {
   constructor({ getConfig, saveConfig, logger }) {
@@ -133,10 +139,20 @@ class OneCommeClient {
     }
   }
 
-  async createService(name) {
+  async createService(name, platform = '') {
+    const newId = typeof crypto.randomUUID === 'function'
+      ? crypto.randomUUID()
+      : `${Date.now()}-${crypto.randomBytes(8).toString('hex')}`;
+    const color = DEFAULT_PLATFORM_COLORS[platform] || { r: 120, g: 120, b: 255 };
+
     const res = await this.requestJson('POST', '/api/services', {
+      id: newId,
       name,
-      enabled: true,
+      url: '',
+      write: true,
+      speech: true,
+      enabled: false,
+      color,
     });
     this.invalidateServicesCache();
 
@@ -149,7 +165,7 @@ class OneCommeClient {
     }
 
     const services = await this.getServices({ forceRefresh: true });
-    const matched = services.find((svc) => svc.name === name);
+    const matched = services.find((svc) => svc.id === newId || svc.name === name);
     if (matched) {
       return matched;
     }
@@ -200,7 +216,7 @@ class OneCommeClient {
 
     if (config.autoCreateService) {
       this.logger.info(`[X-IG-Bridge] わんコメ枠「${platformCfg.name}」を自動作成します。`);
-      const created = await this.createService(platformCfg.name);
+      const created = await this.createService(platformCfg.name, platform);
       const nextConfig = {
         ...config,
         services: {

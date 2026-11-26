@@ -300,6 +300,7 @@ class BridgeServer {
         502,
         {
           ok: false,
+          error: err.message,
           accepted: 0,
           skippedDuplicate: 0,
           skippedFiltered: 0,
