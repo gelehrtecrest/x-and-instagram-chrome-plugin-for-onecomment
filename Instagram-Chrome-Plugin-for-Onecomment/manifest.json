@@ -7,10 +7,12 @@
   "description": "Instagram Live（ライブ配信）のコメントを取得してわんコメ（OneComme）へ送信するChrome拡張機能です。",
   "permissions": [
     "storage",
-    "tabs"
+    "tabs",
+    "scripting"
   ],
   "host_permissions": [
     "https://www.instagram.com/*",
+    "https://instagram.com/*",
     "http://127.0.0.1/*",
     "http://localhost/*"
   ],
@@ -20,7 +22,19 @@
   "content_scripts": [
     {
       "matches": [
-        "https://www.instagram.com/*"
+        "https://www.instagram.com/*",
+        "https://instagram.com/*"
+      ],
+      "js": [
+        "page_hook.js"
+      ],
+      "run_at": "document_start",
+      "world": "MAIN"
+    },
+    {
+      "matches": [
+        "https://www.instagram.com/*",
+        "https://instagram.com/*"
       ],
       "js": [
         "selectors.js",

@@ -192,9 +192,32 @@ async function sendCommentsWithRetry(payload) {
   return { ok: false, error: lastErr ? lastErr.message : '不明なエラー' };
 }
 
+async function injectIntoExistingInstagramTabs() {
+  if (!chrome.scripting || typeof chrome.scripting.executeScript !== 'function') return;
+  try {
+    const tabs = await chrome.tabs.query({
+      url: ['https://www.instagram.com/*', 'https://instagram.com/*'],
+    });
+    for (const tab of tabs) {
+      if (!tab || !tab.id) continue;
+      try {
+        await chrome.scripting.executeScript({
+          target: { tabId: tab.id },
+          files: ['selectors.js', 'content.js'],
+        });
+      } catch {
+        // 権限不足や特殊タブは無視
+      }
+    }
+  } catch {
+    // ignore
+  }
+}
+
 chrome.runtime.onInstalled.addListener(async () => {
   const settings = await getSettings();
   await chrome.storage.local.set({ settings });
+  await injectIntoExistingInstagramTabs();
   await checkHealth();
 });
 

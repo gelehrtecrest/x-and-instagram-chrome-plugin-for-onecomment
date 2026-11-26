@@ -12,6 +12,7 @@ const testSendBtn = document.getElementById('testSendBtn');
 const refreshBtn = document.getElementById('refreshBtn');
 const openOptionsBtn = document.getElementById('openOptionsBtn');
 const resetStatsBtn = document.getElementById('resetStatsBtn');
+const copyDiagBtn = document.getElementById('copyDiagBtn');
 
 function setBadge(el, text, cls) {
   el.textContent = text;
@@ -66,6 +67,42 @@ function renderState(settings, state) {
   }
 }
 
+function isInstagramOriginUrl(urlString) {
+  if (typeof urlString !== 'string' || !urlString) return false;
+  try {
+    const parsed = new URL(urlString);
+    if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') return false;
+    const host = parsed.hostname.toLowerCase();
+    return host === 'www.instagram.com' || host === 'instagram.com';
+  } catch {
+    return false;
+  }
+}
+
+function showTabHint(message) {
+  if (!message) return;
+  if (errorBox.classList.contains('hidden') || !errorBox.textContent.trim()) {
+    errorBox.textContent = message;
+    errorBox.classList.remove('hidden');
+  }
+}
+
+async function queryTabStatusWithAutoInject(tabId) {
+  try {
+    return await chrome.tabs.sendMessage(tabId, { type: 'GET_TAB_STATUS' });
+  } catch (firstErr) {
+    if (!chrome.scripting || typeof chrome.scripting.executeScript !== 'function') {
+      throw firstErr;
+    }
+    await chrome.scripting.executeScript({
+      target: { tabId },
+      files: ['selectors.js', 'content.js'],
+    });
+    await new Promise((r) => setTimeout(r, 150));
+    return await chrome.tabs.sendMessage(tabId, { type: 'GET_TAB_STATUS' });
+  }
+}
+
 async function checkActiveTab() {
   try {
     const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
@@ -73,16 +110,30 @@ async function checkActiveTab() {
       setBadge(tabStatus, '対象外', 'badge-muted');
       return;
     }
-    const res = await chrome.tabs.sendMessage(tab.id, { type: 'GET_TAB_STATUS' });
-    if (res && res.containerFound) {
-      setBadge(tabStatus, 'ライブ監視中', 'badge-ok');
+
+    if (tab.url && !isInstagramOriginUrl(tab.url)) {
+      setBadge(tabStatus, 'Instagramページ以外', 'badge-muted');
+      return;
+    }
+
+    const res = await queryTabStatusWithAutoInject(tab.id);
+    if (res && (res.apiActive || res.pollFetchCount > 0)) {
+      setBadge(tabStatus, 'ライブ監視中 (API)', 'badge-ok');
+    } else if (res && res.domFound) {
+      setBadge(tabStatus, 'ライブ監視中 (DOM)', 'badge-ok');
+    } else if (res && res.isLivePage && !res.hookAlive) {
+      setBadge(tabStatus, '要ページ再読込', 'badge-warn');
+      showTabHint('Instagram Liveのタブを F5 で再読み込みしてください（通信フックを有効化します）。');
     } else if (res && res.isLivePage) {
       setBadge(tabStatus, 'コメント欄待機中', 'badge-warn');
     } else {
       setBadge(tabStatus, 'Instagram Live以外', 'badge-muted');
     }
-  } catch {
-    setBadge(tabStatus, 'Instagram以外', 'badge-muted');
+  } catch (err) {
+    setBadge(tabStatus, 'タブ未接続', 'badge-err');
+    showTabHint(
+      `タブとの通信に失敗しました: ${(err && err.message) || '不明なエラー'}（InstagramタブをF5で再読み込みしてください）`
+    );
   }
 }
 
@@ -132,5 +183,86 @@ resetStatsBtn.addEventListener('click', async () => {
   await chrome.runtime.sendMessage({ type: 'RESET_STATS' });
   await loadAll();
 });
+
+async function queryDiagnosticsWithFallback(tab) {
+  let diag = null;
+  let sendError = '';
+  try {
+    diag = await chrome.tabs.sendMessage(tab.id, { type: 'GET_DIAGNOSTICS' });
+  } catch (err) {
+    sendError = (err && err.message) || String(err);
+  }
+
+  // 応答が undefined / 失敗の場合、Instagramタブなら自動注入してリトライ
+  if (!diag && isInstagramOriginUrl(tab.url || '') && chrome.scripting && typeof chrome.scripting.executeScript === 'function') {
+    try {
+      await chrome.scripting.executeScript({
+        target: { tabId: tab.id },
+        files: ['selectors.js', 'content.js'],
+      });
+      await new Promise((r) => setTimeout(r, 150));
+      diag = await chrome.tabs.sendMessage(tab.id, { type: 'GET_DIAGNOSTICS' });
+      sendError = '';
+    } catch (retryErr) {
+      sendError = (retryErr && retryErr.message) || String(retryErr);
+    }
+  }
+
+  // それでも取れない場合はページ状態を直接プローブしてフォールバック情報を返す
+  if (!diag) {
+    let pageProbe = null;
+    if (isInstagramOriginUrl(tab.url || '') && chrome.scripting && typeof chrome.scripting.executeScript === 'function') {
+      try {
+        const [{ result }] = await chrome.scripting.executeScript({
+          target: { tabId: tab.id },
+          func: () => ({
+            href: location.href,
+            hasSelectors: Boolean(globalThis.InstagramLiveSelectors),
+            hasCollectDiag: Boolean(
+              globalThis.InstagramLiveSelectors &&
+                typeof globalThis.InstagramLiveSelectors.collectDomDiagnostics === 'function'
+            ),
+            contentLoaded: Boolean(globalThis.__IG_LIVE_ONECOMME_CONTENT_LOADED__),
+            videoCount: document.querySelectorAll('video').length,
+            inputCount: document.querySelectorAll('textarea, input, [contenteditable="true"]').length,
+          }),
+        });
+        pageProbe = result || null;
+      } catch (probeErr) {
+        pageProbe = { probeError: (probeErr && probeErr.message) || String(probeErr) };
+      }
+    }
+    diag = {
+      fallback: true,
+      tabUrl: tab.url || '',
+      tabStatusText: tabStatus.textContent || '',
+      sendError: sendError || 'GET_DIAGNOSTICS returned empty response (reload Instagram tab with F5)',
+      pageProbe,
+    };
+  }
+
+  return diag;
+}
+
+if (copyDiagBtn) {
+  copyDiagBtn.addEventListener('click', async () => {
+    const orig = copyDiagBtn.textContent;
+    copyDiagBtn.textContent = '取得中...';
+    try {
+      const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+      if (!tab || !tab.id) throw new Error('タブ未検出');
+      const diag = await queryDiagnosticsWithFallback(tab);
+      const text = JSON.stringify(diag, null, 2) || '{"error":"empty_diag"}';
+      await navigator.clipboard.writeText(text);
+      copyDiagBtn.textContent = diag && diag.fallback ? '簡易コピー完了' : 'コピー完了';
+    } catch (err) {
+      copyDiagBtn.textContent = '取得失敗';
+      showTabHint(`診断取得失敗: ${(err && err.message) || '不明なエラー'}`);
+    }
+    setTimeout(() => {
+      copyDiagBtn.textContent = orig;
+    }, 1800);
+  });
+}
 
 loadAll({ recheckHealth: true });
