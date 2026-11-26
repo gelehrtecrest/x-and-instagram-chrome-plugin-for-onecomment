@@ -1,0 +1,69 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8" />
+  <title>X Live → わんコメ連携</title>
+  <link rel="stylesheet" href="popup.css" />
+</head>
+<body>
+  <div class="container">
+    <header class="header">
+      <div class="title-group">
+        <span class="platform-dot">X</span>
+        <div>
+          <h1>X Live → わんコメ</h1>
+          <p class="subtitle">配信チャット取得ブリッジ</p>
+        </div>
+      </div>
+      <label class="switch" title="コメント取得のON/OFF">
+        <input type="checkbox" id="enabledToggle" />
+        <span class="slider"></span>
+      </label>
+    </header>
+
+    <section class="card status-card">
+      <div class="status-row">
+        <span class="label">プラグイン接続</span>
+        <span id="bridgeStatus" class="badge badge-muted">確認中...</span>
+      </div>
+      <div class="status-row">
+        <span class="label">現在のタブ</span>
+        <span id="tabStatus" class="badge badge-muted">確認中...</span>
+      </div>
+      <div class="status-row">
+        <span class="label">送信先枠</span>
+        <span id="serviceName" class="value-text">X Live コメント</span>
+      </div>
+      <p id="errorBox" class="error-box hidden"></p>
+    </section>
+
+    <section class="stats-grid">
+      <div class="stat-box">
+        <div class="stat-label">送信済み</div>
+        <div id="sentCount" class="stat-value">0</div>
+      </div>
+      <div class="stat-box">
+        <div class="stat-label">重複/除外</div>
+        <div id="skippedCount" class="stat-value">0</div>
+      </div>
+    </section>
+
+    <section class="card">
+      <div class="section-header">
+        <span>直近の送信コメント</span>
+        <button id="resetStatsBtn" class="text-btn" type="button">クリア</button>
+      </div>
+      <ul id="recentList" class="recent-list">
+        <li class="empty">まだ送信されたコメントはありません</li>
+      </ul>
+    </section>
+
+    <footer class="actions">
+      <button id="testSendBtn" class="btn btn-primary" type="button">テスト送信</button>
+      <button id="refreshBtn" class="btn btn-secondary" type="button">再確認</button>
+      <button id="openOptionsBtn" class="btn btn-secondary" type="button">詳細設定</button>
+    </footer>
+  </div>
+  <script src="popup.js"></script>
+</body>
+</html>

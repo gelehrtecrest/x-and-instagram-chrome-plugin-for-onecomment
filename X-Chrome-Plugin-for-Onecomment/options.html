@@ -1,0 +1,183 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8" />
+  <title>X Live → わんコメ 詳細設定</title>
+  <style>
+    body {
+      margin: 0;
+      padding: 24px;
+      background: #0f1419;
+      color: #e7e9ea;
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Meiryo', sans-serif;
+      font-size: 14px;
+    }
+    .wrap {
+      max-width: 680px;
+      margin: 0 auto;
+    }
+    h1 {
+      font-size: 20px;
+      margin: 0 0 16px;
+    }
+    .card {
+      background: #19222b;
+      border: 1px solid #2a3642;
+      border-radius: 12px;
+      padding: 18px;
+      margin-bottom: 16px;
+    }
+    .card h2 {
+      font-size: 15px;
+      margin: 0 0 12px;
+      color: #7dd3fc;
+    }
+    .field {
+      margin-bottom: 12px;
+    }
+    .field:last-child {
+      margin-bottom: 0;
+    }
+    label {
+      display: block;
+      margin-bottom: 4px;
+      font-size: 13px;
+      color: #cbd5e1;
+    }
+    input[type="text"], input[type="number"], input[type="password"], select {
+      width: 100%;
+      box-sizing: border-box;
+      padding: 8px 10px;
+      border-radius: 8px;
+      border: 1px solid #334155;
+      background: #0f172a;
+      color: #f8fafc;
+      font-size: 13px;
+    }
+    .inline-row {
+      display: flex;
+      gap: 8px;
+    }
+    .inline-row select {
+      flex: 1;
+    }
+    .check-row {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .check-row input {
+      width: auto;
+    }
+    .hint {
+      font-size: 12px;
+      color: #8b98a5;
+      margin-top: 4px;
+    }
+    .actions {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+    button {
+      padding: 9px 16px;
+      border-radius: 8px;
+      border: none;
+      font-weight: 600;
+      cursor: pointer;
+      font-size: 13px;
+    }
+    .btn-primary {
+      background: #1d9bf0;
+      color: #fff;
+    }
+    .btn-secondary {
+      background: #263341;
+      color: #e7e9ea;
+      border: 1px solid #3b4b5c;
+    }
+    #statusMsg {
+      font-size: 13px;
+      color: #4ade80;
+    }
+    #statusMsg.error {
+      color: #f87171;
+    }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>X Live → わんコメ 詳細設定</h1>
+
+    <div class="card">
+      <h2>わんコメプラグイン接続設定</h2>
+      <div class="field">
+        <label for="bridgeUrl">ブリッジサーバーURL</label>
+        <input type="text" id="bridgeUrl" placeholder="http://127.0.0.1:11185" />
+      </div>
+      <div class="field">
+        <label for="token">共有トークン（任意・プラグイン側で設定した場合のみ）</label>
+        <input type="password" id="token" placeholder="未設定の場合は空欄" />
+      </div>
+      <div class="field">
+        <label for="serviceId">送信先のわんコメ枠（X用）</label>
+        <div class="inline-row">
+          <select id="serviceId">
+            <option value="">自動（プラグイン側の「X Live コメント」枠を使用）</option>
+          </select>
+          <button type="button" id="loadServicesBtn" class="btn-secondary">枠一覧を取得</button>
+        </div>
+        <div class="hint">「自動」のままにすると、わんコメプラグインが X Live 用の独立した枠へ自動投入します。</div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>コメント取得設定</h2>
+      <div class="field">
+        <label for="nameFormat">表示名の形式</label>
+        <select id="nameFormat">
+          <option value="display">表示名のみ</option>
+          <option value="both">表示名 (@ハンドル) 併記</option>
+        </select>
+      </div>
+      <div class="field">
+        <label class="check-row">
+          <input type="checkbox" id="skipInitialComments" />
+          <span>ページを開いた時点で表示済みの過去コメントはスキップする</span>
+        </label>
+      </div>
+      <div class="field">
+        <label for="batchIntervalMs">送信バッチまとめ間隔（ミリ秒）</label>
+        <input type="number" id="batchIntervalMs" min="100" max="2000" step="50" />
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>カスタムCSSセレクタ（Xの仕様変更時の上書き用・通常は空欄）</h2>
+      <div class="field">
+        <label for="selContainer">チャットコンテナ セレクタ</label>
+        <input type="text" id="selContainer" placeholder="例: [data-testid=&quot;liveChatMessages&quot;]" />
+      </div>
+      <div class="field">
+        <label for="selItem">コメント行 セレクタ</label>
+        <input type="text" id="selItem" placeholder="例: [data-testid=&quot;liveChatMessage&quot;]" />
+      </div>
+      <div class="field">
+        <label for="selAuthor">ユーザー名 セレクタ</label>
+        <input type="text" id="selAuthor" placeholder="例: [data-testid=&quot;User-Name&quot;]" />
+      </div>
+      <div class="field">
+        <label for="selMessage">本文 セレクタ</label>
+        <input type="text" id="selMessage" placeholder="例: [data-testid=&quot;chatMessageText&quot;]" />
+      </div>
+    </div>
+
+    <div class="actions">
+      <button type="button" id="saveBtn" class="btn-primary">設定を保存</button>
+      <button type="button" id="testConnBtn" class="btn-secondary">接続テスト</button>
+      <span id="statusMsg"></span>
+    </div>
+  </div>
+  <script src="options.js"></script>
+</body>
+</html>
