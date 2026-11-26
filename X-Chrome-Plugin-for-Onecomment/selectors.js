@@ -347,6 +347,47 @@
     return { element: null, selector: '' };
   }
 
+  function countProfileImages(el) {
+    if (!el || typeof el.querySelectorAll !== 'function') return 0;
+    try {
+      return el.querySelectorAll('img[src*="profile_images"]').length;
+    } catch {
+      return 0;
+    }
+  }
+
+  function unwrapSingleChildContainers(rootEl, maxDepth = 5) {
+    let current = rootEl;
+    for (let depth = 0; depth < maxDepth && current; depth += 1) {
+      const children = Array.from(current.children || []).filter((child) => child && child.nodeType === 1);
+      if (children.length !== 1) {
+        return children;
+      }
+      const only = children[0];
+      const grandChildren = Array.from(only.children || []).filter((child) => child && child.nodeType === 1);
+      if (grandChildren.length === 0) {
+        return children;
+      }
+      const tag = only.tagName ? only.tagName.toUpperCase() : '';
+      const isContainerTag = tag === 'DIV' || tag === 'UL' || tag === 'OL' || tag === 'SECTION' || tag === 'MAIN';
+      if (!isContainerTag) {
+        return children;
+      }
+      // 複数コメントを含むラッパー（プロフィール画像が2枚以上、または子要素が1個でさらに内側を持つラッパー）なら掘り下げる
+      const profCount = countProfileImages(only);
+      const onlyHasMultipleMessageChildren =
+        grandChildren.length >= 2 &&
+        (profCount >= 2 ||
+          grandChildren.filter((gc) => gc.querySelector && gc.querySelector('a[href^="/"]')).length >= 2);
+      if (onlyHasMultipleMessageChildren || grandChildren.length === 1) {
+        current = only;
+        continue;
+      }
+      return children;
+    }
+    return Array.from((current && current.children) || []).filter((child) => child && child.nodeType === 1);
+  }
+
   function findMessageElements(rootEl, customItemSelector) {
     if (!rootEl || typeof rootEl.querySelectorAll !== 'function') return [];
 
@@ -367,7 +408,7 @@
       }
     }
 
-    return Array.from(rootEl.children || []).filter((child) => child && child.nodeType === 1);
+    return unwrapSingleChildContainers(rootEl, 5);
   }
 
   function extractHandlesFromElement(itemEl) {
@@ -663,6 +704,11 @@
       }
     }
 
+    // 複数コメントを含む親コンテナを誤って1件としてパースしないように除外
+    if (countProfileImages(itemEl) >= 2) {
+      return null;
+    }
+
     const custom = options.customSelectors || {};
     const nameFormat = options.nameFormat || 'display';
 
@@ -679,33 +725,58 @@
     if (custom.author && custom.author.trim()) {
       authorSelectors.push(custom.author.trim());
     }
-    authorSelectors.push(...DEFAULT_AUTHOR_SELECTORS);
+    authorSelectors.push(...DEFAULT_AUTHOR_SELECTORS, 'a[href^="/"]', 'a[role="link"]');
 
     let authorEl = null;
+    let fallbackHandleOnlyName = '';
+    let fallbackHandleOnlyEl = null;
+
     for (const selector of authorSelectors) {
       try {
-        const el = itemEl.querySelector(selector);
-        if (el) {
+        const els =
+          typeof itemEl.querySelectorAll === 'function'
+            ? Array.from(itemEl.querySelectorAll(selector))
+            : [];
+        for (const el of els) {
           const text = normalizeWhitespace(extractTextWithEmoji(el));
-          if (text && !isUiNoiseText(text)) {
-            displayName = text;
-            authorEl = el;
-            break;
+          if (!text || isUiNoiseText(text)) continue;
+          if (/^@[A-Za-z0-9_]{1,30}$/.test(text)) {
+            if (!handle) handle = text.slice(1);
+            if (!fallbackHandleOnlyName) {
+              fallbackHandleOnlyName = text;
+              fallbackHandleOnlyEl = el;
+            }
+            continue;
           }
+          // リンクに本文まで含まれている長すぎるテキストはスキップ
+          if (text.length > 60 && (selector === 'a[href^="/"]' || selector === 'a[role="link"]')) {
+            continue;
+          }
+          displayName = text;
+          authorEl = el;
+          break;
         }
+        if (displayName) break;
       } catch {
         // ignore invalid selector
       }
     }
 
+    let usedHandleFallbackForName = false;
+    if (!displayName && fallbackHandleOnlyName) {
+      displayName = fallbackHandleOnlyName.replace(/^@/, '');
+      authorEl = fallbackHandleOnlyEl;
+      usedHandleFallbackForName = true;
+    }
     if (!displayName && handle) {
       displayName = handle;
+      usedHandleFallbackForName = true;
     }
 
     let commentText = '';
 
     // 2. 本文抽出（標準セレクタ）
-    if (displayName) {
+    if (displayName && !usedHandleFallbackForName) {
       const messageSelectors = [];
       if (custom.message && custom.message.trim()) {
         messageSelectors.push(custom.message.trim());
@@ -721,7 +792,9 @@
             }
             const rawText = normalizeWhitespace(extractTextWithEmoji(el));
             if (!rawText) continue;
-            if (rawText === displayName || rawText === `@${handle}`) continue;
+            if (rawText === displayName || rawText === `@${handle}` || /^@[A-Za-z0-9_]{1,30}$/.test(rawText)) {
+              continue;
+            }
             const cleanedText = stripAuthorPrefix(rawText, displayName, handle);
             if (!cleanedText) continue;
             if (isUiNoiseText(cleanedText)) continue;
@@ -735,19 +808,47 @@
       }
     }
 
-    // 3. フォールバック: <a>タグを使わないX Liveチャット行（[プロフィール画像 + ユーザー名span + 本文span] 構造）
+    // 3. フォールバック: 葉ノードのテキストセグメント分解（[表示名, @handle, 本文] や <a>なしのX Live行に対応）
     if (!displayName || !commentText) {
       const segments = collectLeafTextSegments(itemEl).filter((s) => !isUiNoiseText(s));
       const nonHandleSegments = [];
+      let handleSegmentIndex = -1;
+
       for (const seg of segments) {
         if (/^@[A-Za-z0-9_]{1,30}$/.test(seg)) {
           if (!handle) handle = seg.slice(1);
+          if (handleSegmentIndex === -1) handleSegmentIndex = nonHandleSegments.length;
+          continue;
+        }
+        // "ゲレの工房@gelehrte_crest" のように名前と@handleが1つのセグメントに結合している場合は分離
+        const inlineHandleMatch = seg.match(/^(.+?)\s*(@[A-Za-z0-9_]{1,30})(.*)$/);
+        if (inlineHandleMatch) {
+          const beforeH = normalizeWhitespace(inlineHandleMatch[1]);
+          const foundHandle = inlineHandleMatch[2].slice(1);
+          const afterH = normalizeWhitespace(inlineHandleMatch[3]);
+          if (!handle) handle = foundHandle;
+          if (beforeH) nonHandleSegments.push(beforeH);
+          if (handleSegmentIndex === -1) handleSegmentIndex = nonHandleSegments.length;
+          if (afterH) nonHandleSegments.push(afterH);
           continue;
         }
         nonHandleSegments.push(seg);
       }
 
-      if (!displayName && nonHandleSegments.length >= 2) {
+      // ハンドルしか取れておらず、@handleの前後にセグメントがある場合は [前=表示名, 後=本文] として分離
+      if (usedHandleFallbackForName && handleSegmentIndex > 0 && handleSegmentIndex < nonHandleSegments.length) {
+        const beforeParts = nonHandleSegments.slice(0, handleSegmentIndex);
+        const afterParts = nonHandleSegments.slice(handleSegmentIndex);
+        const candidateAuthor = normalizeWhitespace(beforeParts.join(' '));
+        const candidateBody = normalizeWhitespace(afterParts.join(' '));
+        if (candidateAuthor && candidateAuthor.length <= 40 && candidateBody && !isUiNoiseText(candidateBody)) {
+          displayName = candidateAuthor;
+          commentText = candidateBody;
+          usedHandleFallbackForName = false;
+        }
+      }
+
+      if ((!displayName || usedHandleFallbackForName) && !commentText && nonHandleSegments.length >= 2) {
         const candidateAuthor = nonHandleSegments[0];
         const candidateBody = nonHandleSegments.slice(1).join(' ').trim();
         if (
@@ -760,14 +861,50 @@
           commentText = candidateBody;
         }
       } else if (displayName && !commentText) {
-        const fullText = normalizeWhitespace(extractTextWithEmoji(itemEl));
-        if (fullText.length <= 600) {
-          let rest = stripAuthorPrefix(fullText, displayName, handle);
-          if (rest === fullText && fullText.startsWith(displayName)) {
-            rest = stripAuthorPrefix(fullText.slice(displayName.length), displayName, handle);
+        const cleanAuthorForMatch = displayName.replace(/\s*@[A-Za-z0-9_]+$/, '').trim();
+        const remainingSegments = nonHandleSegments.filter((seg, idx) => {
+          if (seg === displayName || seg === cleanAuthorForMatch || seg === `@${handle}` || seg === handle) {
+            return false;
           }
-          if (rest && rest !== fullText && rest !== `@${handle}` && !isUiNoiseText(rest)) {
-            commentText = rest;
+          // 先頭セグメントが "表示名@handle" の形式だった場合も除外
+          if (idx === 0 && cleanAuthorForMatch && seg.startsWith(cleanAuthorForMatch) && seg.length <= cleanAuthorForMatch.length + 2) {
+            return false;
+          }
+          return true;
+        });
+
+        if (remainingSegments.length > 0) {
+          const joined = normalizeWhitespace(remainingSegments.join(' '));
+          const cleaned = stripAuthorPrefix(joined, displayName, handle);
+          if (cleaned && cleaned !== displayName && cleaned !== `@${handle}` && !isUiNoiseText(cleaned)) {
+            commentText = cleaned;
+          }
+        }
+
+        if (!commentText) {
+          const fullText = normalizeWhitespace(extractTextWithEmoji(itemEl));
+          if (fullText.length <= 600) {
+            let rest = stripAuthorPrefix(fullText, displayName, handle);
+            if (rest === fullText && fullText.startsWith(displayName)) {
+              rest = stripAuthorPrefix(fullText.slice(displayName.length), displayName, handle);
+            }
+            if (rest === fullText && handle) {
+              const handleToken = `@${handle}`;
+              const idx = fullText.toLowerCase().indexOf(handleToken.toLowerCase());
+              if (idx >= 0) {
+                const beforeH = normalizeWhitespace(fullText.slice(0, idx));
+                const afterH = normalizeWhitespace(fullText.slice(idx + handleToken.length));
+                if (beforeH && (!displayName || displayName === handle)) {
+                  displayName = beforeH;
+                }
+                if (afterH) {
+                  rest = afterH;
+                }
+              }
+            }
+            if (rest && rest !== fullText && rest !== `@${handle}` && !isUiNoiseText(rest)) {
+              commentText = rest;
+            }
           }
         }
       }
@@ -871,13 +1008,31 @@
           hasImg: Boolean(c.querySelector && c.querySelector('img[src*="profile_images"]')),
           hasLink: Boolean(c.querySelector && c.querySelector('a[href^="/"]')),
         }));
+      const resolvedItems = findMessageElements(found.element, '');
+      const sampleItems = resolvedItems.slice(-3).map((item) => {
+        const parsed = parseChatMessageElement(item, { nameFormat: 'display' });
+        return {
+          tag: item.tagName,
+          testid: item.getAttribute ? item.getAttribute('data-testid') || '' : '',
+          childCount: item.children ? item.children.length : 0,
+          profileImgCount: countProfileImages(item),
+          handles: extractHandlesFromElement(item).slice(0, 4),
+          leafSegments: collectLeafTextSegments(item).slice(0, 6),
+          text: normalizeWhitespace(extractTextWithEmoji(item)).slice(0, 100),
+          parsed: parsed
+            ? { name: parsed.name, comment: parsed.comment, userId: parsed.userId }
+            : null,
+        };
+      });
       containerInfo = {
         selector: found.selector,
         tag: found.element.tagName,
         testid: found.element.getAttribute('data-testid') || '',
         childCount: found.element.children ? found.element.children.length : 0,
+        resolvedItemCount: resolvedItems.length,
         size: rect ? `${Math.round(rect.width)}x${Math.round(rect.height)}` : '',
         sampleChildren,
+        sampleItems,
       };
     }
 
@@ -895,6 +1050,7 @@
     isXLivePage,
     isUiNoiseText,
     extractTextWithEmoji,
+    countProfileImages,
     findChatContainer,
     findMessageElements,
     parseChatMessageElement,

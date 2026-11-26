@@ -252,7 +252,23 @@ if (copyDiagBtn) {
       const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
       if (!tab || !tab.id) throw new Error('タブ未検出');
       const diag = await queryDiagnosticsWithFallback(tab);
-      const text = JSON.stringify(diag, null, 2) || '{"error":"empty_diag"}';
+      const bgState = await chrome.runtime.sendMessage({ type: 'GET_STATE' }).catch(() => null);
+      const combined = {
+        ...diag,
+        bridgeState:
+          bgState && bgState.ok
+            ? {
+                enabled: Boolean(bgState.settings && bgState.settings.enabled),
+                skipInitialComments: Boolean(bgState.settings && bgState.settings.skipInitialComments),
+                connected: Boolean(bgState.state && bgState.state.connected),
+                onecommeReachable: Boolean(bgState.state && bgState.state.onecommeReachable),
+                sentCount: (bgState.state && bgState.state.sentCount) || 0,
+                skippedCount: (bgState.state && bgState.state.skippedCount) || 0,
+                lastError: (bgState.state && bgState.state.lastError) || '',
+              }
+            : null,
+      };
+      const text = JSON.stringify(combined, null, 2) || '{"error":"empty_diag"}';
       await navigator.clipboard.writeText(text);
       copyDiagBtn.textContent = diag && diag.fallback ? '簡易コピー完了' : 'コピー完了';
     } catch (err) {

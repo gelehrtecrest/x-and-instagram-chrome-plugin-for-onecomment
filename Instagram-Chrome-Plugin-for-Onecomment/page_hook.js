@@ -244,6 +244,10 @@
     if (event.source !== window || !event.data) return;
     if (event.data.source === CONTENT_SOURCE && event.data.type === 'PING') {
       postStatus();
+    } else if (event.data.source === CONTENT_SOURCE && event.data.type === 'RESET_NAV') {
+      pollFetchCount = 0;
+      postCommentCount = 0;
+      postStatus();
     }
   });
 

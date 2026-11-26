@@ -9,12 +9,14 @@
   const MAX_PAYLOAD_LEN = 128 * 1024;
 
   const NativeWebSocket = window.WebSocket;
+  const NativeEventSource = typeof window.EventSource === 'function' ? window.EventSource : null;
   const NativeFetch = window.fetch;
   const NativeXhrOpen = typeof XMLHttpRequest !== 'undefined' ? XMLHttpRequest.prototype.open : null;
   const NativeXhrSend = typeof XMLHttpRequest !== 'undefined' ? XMLHttpRequest.prototype.send : null;
 
   const activeChatSockets = new Set();
   const seenWsUrls = [];
+  const seenEventSourceUrls = [];
   const seenChatNetUrls = [];
   let historyFetchCount = 0;
 
@@ -49,7 +51,21 @@
   function isInterestingNetUrl(url) {
     if (typeof url !== 'string') return false;
     const lower = url.toLowerCase();
-    if (lower.includes('.ts') || lower.includes('.m3u8') || lower.includes('/transcoding/')) {
+    if (
+      lower.includes('.ts') ||
+      lower.includes('.m3u8') ||
+      lower.includes('.m4s') ||
+      lower.includes('.mp4') ||
+      lower.includes('.jpg') ||
+      lower.includes('.jpeg') ||
+      lower.includes('.png') ||
+      lower.includes('.webp') ||
+      lower.includes('.svg') ||
+      lower.includes('/transcoding/') ||
+      lower.includes('client_event') ||
+      lower.includes('/jot/') ||
+      lower.includes('ces/p2')
+    ) {
       return false;
     }
     return (
@@ -59,7 +75,10 @@
       lower.includes('periscope') ||
       lower.includes('broadcast') ||
       lower.includes('live_video_stream') ||
-      lower.includes('live_pipeline')
+      lower.includes('live_pipeline') ||
+      lower.includes('/i/api/graphql/') ||
+      lower.includes('/chat') ||
+      lower.includes('message')
     );
   }
 
@@ -99,6 +118,7 @@
       activeCount: activeChatSockets.size,
       historyFetchCount,
       seenUrls: [...seenWsUrls],
+      seenEventSourceUrls: [...seenEventSourceUrls],
       seenNetUrls: [...seenChatNetUrls],
       ...extra,
     });
@@ -211,6 +231,39 @@
     window.WebSocket = PatchedWebSocket;
   }
 
+  // 1.5. EventSource (SSE) フック
+  if (typeof NativeEventSource === 'function') {
+    function PatchedEventSource(url, eventSourceInitDict) {
+      const es =
+        eventSourceInitDict !== undefined
+          ? new NativeEventSource(url, eventSourceInitDict)
+          : new NativeEventSource(url);
+      const urlStr = typeof url === 'string' ? url : String(url || '');
+      pushUniqueLimited(seenEventSourceUrls, sanitizeUrl(urlStr), 8);
+      es.addEventListener('message', (event) => {
+        if (typeof event.data === 'string' && looksLikeChatmanText(event.data)) {
+          postHookMessage('WS_MESSAGE', {
+            url: sanitizeUrl(urlStr),
+            direction: 'sse',
+            data: event.data,
+          });
+        }
+      });
+      postStatus();
+      return es;
+    }
+    PatchedEventSource.prototype = NativeEventSource.prototype;
+    PatchedEventSource.CONNECTING = NativeEventSource.CONNECTING;
+    PatchedEventSource.OPEN = NativeEventSource.OPEN;
+    PatchedEventSource.CLOSED = NativeEventSource.CLOSED;
+    try {
+      Object.setPrototypeOf(PatchedEventSource, NativeEventSource);
+    } catch {
+      // ignore
+    }
+    window.EventSource = PatchedEventSource;
+  }
+
   // 2. fetch フック
   if (typeof NativeFetch === 'function') {
     window.fetch = function patchedFetch(input, init) {
@@ -222,7 +275,7 @@
             : '';
 
       if (isInterestingNetUrl(urlStr)) {
-        pushUniqueLimited(seenChatNetUrls, sanitizeUrl(urlStr), 12);
+        pushUniqueLimited(seenChatNetUrls, sanitizeUrl(urlStr), 25);
       }
 
       const promise = NativeFetch.apply(this, arguments);
@@ -254,7 +307,7 @@
     XMLHttpRequest.prototype.send = function patchedSend() {
       const urlStr = this.__xLiveHookUrl || '';
       if (isInterestingNetUrl(urlStr)) {
-        pushUniqueLimited(seenChatNetUrls, sanitizeUrl(urlStr), 12);
+        pushUniqueLimited(seenChatNetUrls, sanitizeUrl(urlStr), 25);
       }
       if (isHistoryApiUrl(urlStr)) {
         this.addEventListener('load', () => {
@@ -274,6 +327,9 @@
   window.addEventListener('message', (event) => {
     if (event.source !== window || !event.data) return;
     if (event.data.source === CONTENT_SOURCE && event.data.type === 'PING') {
+      postStatus();
+    } else if (event.data.source === CONTENT_SOURCE && event.data.type === 'RESET_NAV') {
+      historyFetchCount = 0;
       postStatus();
     }
   });

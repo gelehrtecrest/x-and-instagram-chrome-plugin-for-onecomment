@@ -322,6 +322,66 @@
     return { element: null, selector: '' };
   }
 
+  function isAvatarImageElement(img) {
+    if (!img || typeof img.getAttribute !== 'function') return false;
+    const src = img.getAttribute('src') || '';
+    const alt = img.getAttribute('alt') || '';
+    if (!src) return false;
+    const lowerSrc = src.toLowerCase();
+    if (lowerSrc.includes('/emoji/') || lowerSrc.includes('/rsrc.php')) {
+      return false;
+    }
+    if (/プロフィール写真|profile picture|avatar/i.test(alt)) {
+      return true;
+    }
+    return lowerSrc.includes('cdninstagram.com') || lowerSrc.includes('fbcdn.net');
+  }
+
+  function countAvatarImages(el) {
+    if (!el || typeof el.querySelectorAll !== 'function') return 0;
+    try {
+      const imgs = el.querySelectorAll('img[src]');
+      let count = 0;
+      for (const img of imgs) {
+        if (isAvatarImageElement(img)) count += 1;
+      }
+      return count;
+    } catch {
+      return 0;
+    }
+  }
+
+  function unwrapSingleChildContainers(rootEl, maxDepth = 5) {
+    let current = rootEl;
+    for (let depth = 0; depth < maxDepth && current; depth += 1) {
+      const children = Array.from(current.children || []).filter((child) => child && child.nodeType === 1);
+      if (children.length !== 1) {
+        return children;
+      }
+      const only = children[0];
+      const grandChildren = Array.from(only.children || []).filter((child) => child && child.nodeType === 1);
+      if (grandChildren.length === 0) {
+        return children;
+      }
+      const tag = only.tagName ? only.tagName.toUpperCase() : '';
+      const isContainerTag = tag === 'DIV' || tag === 'UL' || tag === 'OL' || tag === 'SECTION' || tag === 'MAIN';
+      if (!isContainerTag) {
+        return children;
+      }
+      const avatarCount = countAvatarImages(only);
+      const onlyHasMultipleMessageChildren =
+        grandChildren.length >= 2 &&
+        (avatarCount >= 2 ||
+          grandChildren.filter((gc) => gc.querySelector && gc.querySelector('a[href^="/"]')).length >= 2);
+      if (onlyHasMultipleMessageChildren || grandChildren.length === 1) {
+        current = only;
+        continue;
+      }
+      return children;
+    }
+    return Array.from((current && current.children) || []).filter((child) => child && child.nodeType === 1);
+  }
+
   function findMessageElements(rootEl, customItemSelector) {
     if (!rootEl || typeof rootEl.querySelectorAll !== 'function') return [];
 
@@ -342,7 +402,7 @@
       }
     }
 
-    return Array.from(rootEl.children || []).filter((child) => child && child.nodeType === 1);
+    return unwrapSingleChildContainers(rootEl, 5);
   }
 
   function extractUsernamesFromElement(itemEl) {
@@ -585,6 +645,11 @@
       }
     }
 
+    // 複数コメントを含む親コンテナを誤って1件としてパースしないように除外
+    if (countAvatarImages(itemEl) >= 2) {
+      return null;
+    }
+
     const custom = options.customSelectors || {};
 
     const usernames = extractUsernamesFromElement(itemEl);
@@ -604,15 +669,19 @@
     let displayName = '';
     for (const selector of authorSelectors) {
       try {
-        const el = itemEl.querySelector(selector);
-        if (el) {
+        const els =
+          typeof itemEl.querySelectorAll === 'function'
+            ? Array.from(itemEl.querySelectorAll(selector))
+            : [];
+        for (const el of els) {
           const text = normalizeWhitespace(extractTextWithEmoji(el));
-          if (text && !isUiNoiseText(text)) {
-            displayName = text;
-            authorEl = el;
-            break;
-          }
+          if (!text || isUiNoiseText(text)) continue;
+          if (text.length > 60 && selector === 'a[href^="/"]') continue;
+          displayName = text;
+          authorEl = el;
+          break;
         }
+        if (displayName) break;
       } catch {
         // ignore invalid selector
       }
@@ -699,11 +768,23 @@
           }
         }
       } else if (finalName && !commentText) {
-        const fullText = normalizeWhitespace(extractTextWithEmoji(itemEl));
-        if (fullText.length <= 600) {
-          const rest = stripAuthorPrefix(fullText, finalName, username);
-          if (rest && rest !== fullText && rest !== finalName && rest !== username && !isUiNoiseText(rest)) {
-            commentText = rest;
+        const remainingSegments = segments.filter((seg) => {
+          return seg !== finalName && seg !== username && seg !== `@${username}`;
+        });
+        if (remainingSegments.length > 0) {
+          const joined = normalizeWhitespace(remainingSegments.join(' '));
+          const cleaned = stripAuthorPrefix(joined, finalName, username);
+          if (cleaned && cleaned !== finalName && cleaned !== username && !isUiNoiseText(cleaned)) {
+            commentText = cleaned;
+          }
+        }
+        if (!commentText) {
+          const fullText = normalizeWhitespace(extractTextWithEmoji(itemEl));
+          if (fullText.length <= 600) {
+            const rest = stripAuthorPrefix(fullText, finalName, username);
+            if (rest && rest !== fullText && rest !== finalName && rest !== username && !isUiNoiseText(rest)) {
+              commentText = rest;
+            }
           }
         }
       }
@@ -809,13 +890,36 @@
               : null,
           };
         });
+      const resolvedItems = findMessageElements(found.element, '');
+      const sampleItems = resolvedItems.slice(-3).map((item) => {
+        const parsed = parseLiveCommentElement(item);
+        return {
+          tag: item.tagName,
+          testid: item.getAttribute ? item.getAttribute('data-testid') || '' : '',
+          childCount: item.children ? item.children.length : 0,
+          avatarImgCount: countAvatarImages(item),
+          usernames: extractUsernamesFromElement(item).slice(0, 4),
+          leafSegments: collectLeafTextSegments(item).slice(0, 6),
+          text: normalizeWhitespace(extractTextWithEmoji(item)).slice(0, 100),
+          parsed: parsed
+            ? {
+                name: parsed.name,
+                comment: parsed.comment.slice(0, 50),
+                isSystem: parsed.isSystem,
+                hasProfileImage: Boolean(parsed.profileImage),
+              }
+            : null,
+        };
+      });
       containerInfo = {
         selector: found.selector,
         tag: found.element.tagName,
         testid: found.element.getAttribute('data-testid') || '',
         childCount: found.element.children ? found.element.children.length : 0,
+        resolvedItemCount: resolvedItems.length,
         size: rect ? `${Math.round(rect.width)}x${Math.round(rect.height)}` : '',
         sampleChildren,
+        sampleItems,
       };
     }
 
@@ -832,6 +936,7 @@
     isInstagramLivePage,
     isUiNoiseText,
     extractTextWithEmoji,
+    countAvatarImages,
     findChatContainer,
     findMessageElements,
     parseLiveCommentElement,

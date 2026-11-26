@@ -37,24 +37,60 @@
   let wsLastMessageAt = 0;
   let wsSeenUrls = [];
   let seenNetUrls = [];
+  let seenEventSourceUrls = [];
   let wsMsgCount = 0;
+  let wsParsedCount = 0;
   let historyFetchCount = 0;
+
+  // DOM監視の診断カウンタ
+  let domMutationCount = 0;
+  let domScanCount = 0;
+  let domParsedCount = 0;
+  let domEnqueuedCount = 0;
+  let domScanTimer = null;
+  const recentDomSamples = [];
+
+  function pushDomSample(sample) {
+    recentDomSamples.push(sample);
+    if (recentDomSamples.length > 5) {
+      recentDomSamples.shift();
+    }
+  }
 
   const seenOrder = [];
   const seenSet = new Set();
-  const recentContentMap = new Map();
+  const recentApiContentMap = new Map();
+  const seenDomContentCounts = new Map();
+  const elementParseCache = new WeakMap();
   const MAX_SEEN = 1000;
-  const CONTENT_DEDUP_WINDOW_MS = 15000;
+  const MAX_DOM_KEYS = 2000;
+  const API_DEDUP_WINDOW_MS = 30000;
   const pendingComments = [];
 
-  function rememberComment(parsed) {
+  function makeContentKey(parsed) {
+    return `${String((parsed && parsed.userId) || '').toLowerCase()}|${(parsed && parsed.comment) || ''}`;
+  }
+
+  function recordDomContentCount(contentKey, nextCount) {
+    const prev = seenDomContentCounts.get(contentKey) || 0;
+    const updated = Math.max(prev, nextCount);
+    seenDomContentCounts.delete(contentKey);
+    seenDomContentCounts.set(contentKey, updated);
+    while (seenDomContentCounts.size > MAX_DOM_KEYS) {
+      const oldestKey = seenDomContentCounts.keys().next().value;
+      if (oldestKey === undefined) break;
+      seenDomContentCounts.delete(oldestKey);
+    }
+  }
+
+  function rememberComment(parsed, { fromDom = false } = {}) {
     if (!parsed || !parsed.id) return false;
     if (seenSet.has(parsed.id)) return false;
 
     const now = Date.now();
-    const contentKey = `${String(parsed.userId || '').toLowerCase()}|${parsed.comment}`;
-    const prevTs = recentContentMap.get(contentKey);
-    if (prevTs && now - prevTs < CONTENT_DEDUP_WINDOW_MS) {
+    const contentKey = makeContentKey(parsed);
+    const prevApiTs = recentApiContentMap.get(contentKey);
+    if (prevApiTs && now - prevApiTs < API_DEDUP_WINDOW_MS) {
       return false;
     }
 
@@ -65,13 +101,17 @@
       seenSet.delete(oldest);
     }
 
-    recentContentMap.set(contentKey, now);
-    if (recentContentMap.size > MAX_SEEN) {
-      for (const [key, ts] of recentContentMap.entries()) {
-        if (now - ts >= CONTENT_DEDUP_WINDOW_MS) {
-          recentContentMap.delete(key);
+    if (!fromDom) {
+      recentApiContentMap.set(contentKey, now);
+      if (recentApiContentMap.size > MAX_SEEN) {
+        for (const [key, ts] of recentApiContentMap.entries()) {
+          if (now - ts >= API_DEDUP_WINDOW_MS) {
+            recentApiContentMap.delete(key);
+          }
         }
       }
+      // WS / API で既に受信したコメントが直後に DOM に描画されても二重送信しないように記録
+      recordDomContentCount(contentKey, (seenDomContentCounts.get(contentKey) || 0) + 1);
     }
     return true;
   }
@@ -96,6 +136,10 @@
     if (flushTimer) {
       clearTimeout(flushTimer);
       flushTimer = null;
+    }
+    if (domScanTimer) {
+      clearTimeout(domScanTimer);
+      domScanTimer = null;
     }
     pendingComments.length = 0;
     detachObserver();
@@ -146,9 +190,9 @@
     flushTimer = setTimeout(flushPending, delay);
   }
 
-  function enqueueParsedComment(parsed, { initialSeed = false } = {}) {
+  function enqueueParsedComment(parsed, { initialSeed = false, fromDom = false } = {}) {
     if (!parsed) return false;
-    const isNew = rememberComment(parsed);
+    const isNew = rememberComment(parsed, { fromDom });
     if (!isNew) return false;
     if (initialSeed && settings.skipInitialComments) return false;
     if (!settings.enabled) return false;
@@ -162,41 +206,135 @@
     return wsConnected || (wsLastMessageAt > 0 && Date.now() - wsLastMessageAt < 60000);
   }
 
-  function processElement(el, { initialSeed = false } = {}) {
-    if (!el || el.nodeType !== 1) return false;
+  function isWsDeliveringComments() {
+    return wsParsedCount > 0 && isWsPrimaryActive();
+  }
 
-    // WS通信が確立しており、かつヒューリスティック検出コンテナの場合はDOM側の誤爆を抑制
-    const hasCustomContainer = Boolean(settings.customSelectors && settings.customSelectors.container);
-    if (!initialSeed && isWsPrimaryActive() && !hasCustomContainer && activeContainerSelector.startsWith('heuristic:')) {
-      return false;
+  function collectFlatMessageElements(container) {
+    const customItem = settings.customSelectors && settings.customSelectors.item;
+    const initial = Selectors.findMessageElements(container, customItem);
+    const out = [];
+    for (const el of initial) {
+      if (!el || el.nodeType !== 1) continue;
+      if (typeof Selectors.countProfileImages === 'function' && Selectors.countProfileImages(el) >= 2) {
+        const nested = Selectors.findMessageElements(el, customItem);
+        for (const child of nested) {
+          if (child && child.nodeType === 1 && child !== el) {
+            out.push(child);
+          }
+        }
+      } else {
+        out.push(el);
+      }
     }
+    return out;
+  }
 
+  function parseElementCached(el) {
+    if (!el || el.nodeType !== 1) return null;
+    const textSnapshot = el.textContent || '';
+    const cached = elementParseCache.get(el);
+    if (cached && cached.textSnapshot === textSnapshot && cached.nameFormat === settings.nameFormat) {
+      return cached.parsed;
+    }
     const parsed = Selectors.parseChatMessageElement(el, {
       nameFormat: settings.nameFormat,
       customSelectors: settings.customSelectors,
     });
-    if (!parsed) return false;
-
-    return enqueueParsedComment(parsed, { initialSeed });
+    elementParseCache.set(el, {
+      textSnapshot,
+      nameFormat: settings.nameFormat,
+      parsed,
+    });
+    return parsed;
   }
 
-  function handleAddedNode(node) {
-    if (!node || node.nodeType !== 1) return;
-    const customItem = settings.customSelectors && settings.customSelectors.item;
-    const nested = Selectors.findMessageElements(node, customItem);
+  function scanActiveContainer({ initialSeed = false } = {}) {
+    if (!activeContainer || !document.contains(activeContainer)) return;
 
-    if (nested.length > 0 && nested[0] !== node) {
-      let parsedAny = false;
-      for (const child of nested) {
-        if (processElement(child)) parsedAny = true;
-      }
-      if (parsedAny) return;
+    // WS通信で実際にコメントをパースできている場合のみ、ヒューリスティックDOM側の誤爆を抑制
+    const hasCustomContainer = Boolean(settings.customSelectors && settings.customSelectors.container);
+    if (!initialSeed && isWsDeliveringComments() && !hasCustomContainer && activeContainerSelector.startsWith('heuristic:')) {
+      return;
     }
 
-    processElement(node);
+    if (!initialSeed) domScanCount += 1;
+
+    const rows = collectFlatMessageElements(activeContainer);
+    const grouped = new Map();
+
+    for (const row of rows) {
+      const parsed = parseElementCached(row);
+      if (!parsed) continue;
+      const contentKey = makeContentKey(parsed);
+      let list = grouped.get(contentKey);
+      if (!list) {
+        list = [];
+        grouped.set(contentKey, list);
+      }
+      list.push(parsed);
+    }
+
+    for (const [contentKey, list] of grouped.entries()) {
+      const curCount = list.length;
+      const prevCount = seenDomContentCounts.get(contentKey) || 0;
+      if (curCount <= prevCount) {
+        continue;
+      }
+
+      recordDomContentCount(contentKey, curCount);
+
+      if (initialSeed && settings.skipInitialComments) {
+        continue;
+      }
+
+      const addedCount = curCount - prevCount;
+      const newItems = list.slice(curCount - addedCount);
+      for (let i = 0; i < newItems.length; i += 1) {
+        const occ = prevCount + i + 1;
+        const base = newItems[i];
+        const stableId =
+          typeof Selectors.fnv1aHash === 'function'
+            ? `x_live_dom_${Selectors.fnv1aHash(`${contentKey}|${occ}`)}`
+            : `${base.id}_occ${occ}`;
+        const item = {
+          ...base,
+          id: stableId,
+          timestamp: Date.now(),
+        };
+        if (!initialSeed) domParsedCount += 1;
+        const enqueued = enqueueParsedComment(item, { initialSeed, fromDom: true });
+        if (!initialSeed && enqueued) {
+          domEnqueuedCount += 1;
+          pushDomSample({
+            name: item.name,
+            comment: item.comment.slice(0, 60),
+            occ,
+            result: 'enqueued',
+          });
+        }
+      }
+    }
+  }
+
+  function scheduleDomScan() {
+    if (domScanTimer !== null) return;
+    domScanTimer = setTimeout(() => {
+      domScanTimer = null;
+      if (!isExtensionContextValid()) {
+        cleanup();
+        return;
+      }
+      if (!settings.enabled) return;
+      scanActiveContainer({ initialSeed: false });
+    }, 80);
   }
 
   function detachObserver() {
+    if (domScanTimer) {
+      clearTimeout(domScanTimer);
+      domScanTimer = null;
+    }
     if (observer) {
       observer.disconnect();
       observer = null;
@@ -210,25 +348,18 @@
     activeContainer = container;
     activeContainerSelector = selector;
 
-    const customItem = settings.customSelectors && settings.customSelectors.item;
-    const existing = Selectors.findMessageElements(container, customItem);
-    for (const el of existing) {
-      processElement(el, { initialSeed: true });
-    }
+    scanActiveContainer({ initialSeed: true });
 
-    observer = new MutationObserver((mutations) => {
+    observer = new MutationObserver(() => {
+      domMutationCount += 1;
       if (!settings.enabled) return;
-      for (const mutation of mutations) {
-        if (mutation.type !== 'childList') continue;
-        for (const node of mutation.addedNodes) {
-          handleAddedNode(node);
-        }
-      }
+      scheduleDomScan();
     });
 
     observer.observe(container, {
       childList: true,
       subtree: true,
+      characterData: true,
     });
   }
 
@@ -249,6 +380,25 @@
     if (location.href !== lastUrl) {
       lastUrl = location.href;
       detachObserver();
+      wsConnected = false;
+      wsLastMessageAt = 0;
+      wsMsgCount = 0;
+      wsParsedCount = 0;
+      historyFetchCount = 0;
+      domMutationCount = 0;
+      domScanCount = 0;
+      domParsedCount = 0;
+      domEnqueuedCount = 0;
+      recentDomSamples.length = 0;
+      seenSet.clear();
+      seenOrder.length = 0;
+      recentApiContentMap.clear();
+      seenDomContentCounts.clear();
+      try {
+        window.postMessage({ source: CONTENT_SOURCE, type: 'RESET_NAV' }, '*');
+      } catch {
+        // ignore
+      }
     }
 
     if (!Selectors.isXLivePage(location.href)) {
@@ -308,6 +458,9 @@
       if (payload && Array.isArray(payload.seenNetUrls)) {
         seenNetUrls = payload.seenNetUrls;
       }
+      if (payload && Array.isArray(payload.seenEventSourceUrls)) {
+        seenEventSourceUrls = payload.seenEventSourceUrls;
+      }
       return;
     }
 
@@ -321,6 +474,7 @@
         nameFormat: settings.nameFormat,
       });
       if (parsed) {
+        wsParsedCount += 1;
         enqueueParsedComment(parsed, { initialSeed: false });
       }
       return;
@@ -396,14 +550,26 @@
           sendResponse({
             url: location.href,
             isLivePage: Selectors.isXLivePage(location.href),
+            enabled: settings.enabled,
+            skipInitialComments: settings.skipInitialComments,
             hookAlive,
             wsConnected: isWsPrimaryActive(),
             wsMsgCount,
+            wsParsedCount,
             historyFetchCount,
             wsSeenUrls,
+            seenEventSourceUrls,
             seenNetUrls,
             domFound,
             containerSelector: activeContainerSelector,
+            domStats: {
+              mutationCount: domMutationCount,
+              scanCount: domScanCount,
+              trackedDomKeys: seenDomContentCounts.size,
+              parsedCount: domParsedCount,
+              enqueuedCount: domEnqueuedCount,
+              recentSamples: [...recentDomSamples],
+            },
             domDiag,
           });
           return true;
