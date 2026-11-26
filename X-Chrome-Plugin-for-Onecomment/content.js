@@ -38,9 +38,13 @@
   let wsSeenUrls = [];
   let seenNetUrls = [];
   let seenEventSourceUrls = [];
+  let seenPipelineTopics = [];
+  let seenSubTopics = [];
+  let seenPipelineSamples = [];
   let wsMsgCount = 0;
   let wsParsedCount = 0;
   let historyFetchCount = 0;
+  let pipelineEventCount = 0;
 
   // DOM監視の診断カウンタ
   let domMutationCount = 0;
@@ -210,14 +214,22 @@
     return wsParsedCount > 0 && isWsPrimaryActive();
   }
 
-  function collectFlatMessageElements(container) {
+  function collectFlatMessageElements(container, depth = 0) {
+    if (!container || container.nodeType !== 1 || depth > 4) return [];
     const customItem = settings.customSelectors && settings.customSelectors.item;
     const initial = Selectors.findMessageElements(container, customItem);
     const out = [];
     for (const el of initial) {
       if (!el || el.nodeType !== 1) continue;
+      if (typeof el.querySelector === 'function' && el.querySelector('video')) {
+        continue;
+      }
+      if (typeof Selectors.hasVisibleInputInside === 'function' && Selectors.hasVisibleInputInside(el)) {
+        // LCA フォールバック時は入力欄エリアをスキップ
+        continue;
+      }
       if (typeof Selectors.countProfileImages === 'function' && Selectors.countProfileImages(el) >= 2) {
-        const nested = Selectors.findMessageElements(el, customItem);
+        const nested = collectFlatMessageElements(el, depth + 1);
         for (const child of nested) {
           if (child && child.nodeType === 1 && child !== el) {
             out.push(child);
@@ -385,6 +397,10 @@
       wsMsgCount = 0;
       wsParsedCount = 0;
       historyFetchCount = 0;
+      pipelineEventCount = 0;
+      seenPipelineTopics = [];
+      seenSubTopics = [];
+      seenPipelineSamples = [];
       domMutationCount = 0;
       domScanCount = 0;
       domParsedCount = 0;
@@ -409,6 +425,18 @@
     pingPageHook();
 
     if (activeContainer && document.contains(activeContainer)) {
+      // LCA フォールバック監視中に、より具体的なチャット一覧コンテナが現れたら昇格する
+      if (activeContainerSelector === 'heuristic:header-input-lca') {
+        const customContainer = settings.customSelectors && settings.customSelectors.container;
+        const refined = Selectors.findChatContainer(document, customContainer, location.href);
+        if (
+          refined.element &&
+          refined.element !== activeContainer &&
+          refined.selector !== 'heuristic:header-input-lca'
+        ) {
+          attachToContainer(refined.element, refined.selector);
+        }
+      }
       return;
     }
 
@@ -452,6 +480,9 @@
       if (payload && typeof payload.historyFetchCount === 'number') {
         historyFetchCount = payload.historyFetchCount;
       }
+      if (payload && typeof payload.pipelineEventCount === 'number') {
+        pipelineEventCount = payload.pipelineEventCount;
+      }
       if (payload && Array.isArray(payload.seenUrls)) {
         wsSeenUrls = payload.seenUrls;
       }
@@ -460,6 +491,34 @@
       }
       if (payload && Array.isArray(payload.seenEventSourceUrls)) {
         seenEventSourceUrls = payload.seenEventSourceUrls;
+      }
+      if (payload && Array.isArray(payload.seenPipelineTopics)) {
+        seenPipelineTopics = payload.seenPipelineTopics;
+      }
+      if (payload && Array.isArray(payload.seenSubTopics)) {
+        seenSubTopics = payload.seenSubTopics;
+      }
+      if (payload && Array.isArray(payload.seenPipelineSamples)) {
+        seenPipelineSamples = payload.seenPipelineSamples;
+      }
+      return;
+    }
+
+    if (type === 'LIVE_PIPELINE_EVENT' && payload && payload.data) {
+      hookAlive = true;
+      pipelineEventCount = Math.max(pipelineEventCount + 1, Number(payload.eventCount) || 0);
+      if (!Selectors.isXLivePage(location.href)) return;
+      if (typeof Selectors.parseLivePipelinePayload === 'function') {
+        const parsed = Selectors.parseLivePipelinePayload(payload.data, {
+          nameFormat: settings.nameFormat,
+        });
+        if (parsed) {
+          wsConnected = true;
+          wsLastMessageAt = Date.now();
+          wsMsgCount += 1;
+          wsParsedCount += 1;
+          enqueueParsedComment(parsed, { initialSeed: false });
+        }
       }
       return;
     }
@@ -521,7 +580,11 @@
 
       chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
         if (message && message.type === 'GET_TAB_STATUS') {
-          pingPageHook();
+          if (!activeContainer || !document.contains(activeContainer)) {
+            checkAndAttach();
+          } else {
+            pingPageHook();
+          }
           const domFound = Boolean(activeContainer && document.contains(activeContainer));
           const wsActive = isWsPrimaryActive();
           sendResponse({
@@ -557,9 +620,13 @@
             wsMsgCount,
             wsParsedCount,
             historyFetchCount,
+            pipelineEventCount,
             wsSeenUrls,
             seenEventSourceUrls,
             seenNetUrls,
+            pipelineTopics: seenPipelineTopics,
+            pipelineSubTopics: seenSubTopics,
+            pipelineSamples: seenPipelineSamples,
             domFound,
             containerSelector: activeContainerSelector,
             domStats: {

@@ -197,6 +197,52 @@
     }
   }
 
+  function isElementVisible(el) {
+    if (!el || el.nodeType !== 1) return false;
+    try {
+      if (el.getAttribute && el.getAttribute('aria-hidden') === 'true') {
+        return false;
+      }
+      if (typeof getComputedStyle === 'function') {
+        const style = getComputedStyle(el);
+        if (style && (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0')) {
+          return false;
+        }
+      }
+      if (typeof el.getBoundingClientRect === 'function') {
+        const rect = el.getBoundingClientRect();
+        if (rect && rect.width <= 0 && rect.height <= 0) {
+          return false;
+        }
+      }
+    } catch {
+      // ignore style/rect errors in minimal environments
+    }
+    return true;
+  }
+
+  function isHiddenHelperInput(inputEl) {
+    if (!inputEl || inputEl.nodeType !== 1) return false;
+    if (inputEl.getAttribute && inputEl.getAttribute('aria-hidden') === 'true') return true;
+    if (inputEl.getAttribute && inputEl.getAttribute('type') === 'hidden') return true;
+    return !isElementVisible(inputEl);
+  }
+
+  function hasVisibleInputInside(el) {
+    if (!el || typeof el.querySelectorAll !== 'function') return false;
+    const inputs = el.querySelectorAll('textarea, input, [contenteditable="true"]');
+    for (const inp of inputs) {
+      if (!isHiddenHelperInput(inp)) return true;
+    }
+    return false;
+  }
+
+  function isStopAncestor(el) {
+    if (!el || el.nodeType !== 1) return true;
+    const tag = el.tagName ? el.tagName.toUpperCase() : '';
+    return tag === 'BODY' || tag === 'HTML' || tag === 'HEADER' || tag === 'NAV';
+  }
+
   function isExcludedContainer(el) {
     if (!el || el.nodeType !== 1) return true;
     const tag = el.tagName ? el.tagName.toUpperCase() : '';
@@ -214,8 +260,31 @@
     return false;
   }
 
-  function pickBestChatListInside(parent, excludeEl) {
+  function findLowestCommonAncestor(a, b, maxDepth = 20) {
+    if (!a || !b) return null;
+    const ancestors = new Set();
+    let cur = a;
+    for (let i = 0; i <= maxDepth && cur; i += 1) {
+      ancestors.add(cur);
+      cur = cur.parentElement;
+    }
+    cur = b;
+    for (let i = 0; i <= maxDepth && cur; i += 1) {
+      if (ancestors.has(cur)) return cur;
+      cur = cur.parentElement;
+    }
+    return null;
+  }
+
+  function pickBestChatListInside(parent, excludeEl, options = {}) {
     if (!parent || typeof parent.querySelectorAll !== 'function') return null;
+    const allowSmall = Boolean(options.allowSmall);
+    const allowLowScore = Boolean(options.allowLowScore);
+    const excludeHeader = options.excludeHeader || null;
+    const minHeight = allowSmall ? 24 : 60;
+    const minWidth = allowSmall ? 100 : 120;
+    const minScore = allowLowScore ? 4 : 8;
+
     const candidates = parent.querySelectorAll('div, ul, section');
     let best = null;
     let bestScore = 0;
@@ -224,23 +293,32 @@
       if (excludeEl && (el === excludeEl || el.contains(excludeEl) || excludeEl.contains(el))) {
         continue;
       }
+      if (excludeHeader && (el === excludeHeader || el.contains(excludeHeader) || excludeHeader.contains(el))) {
+        continue;
+      }
       if (isExcludedContainer(el)) continue;
+      if (!isElementVisible(el)) continue;
 
       const rect = typeof el.getBoundingClientRect === 'function' ? el.getBoundingClientRect() : null;
-      if (rect && (rect.height < 110 || rect.width < 160)) continue;
+      if (rect && (rect.height < minHeight || rect.width < minWidth)) continue;
+
+      if (hasVisibleInputInside(el)) continue;
 
       const scrollable = isScrollableElement(el);
       const childCount = el.children ? el.children.length : 0;
       const profileImgs = el.querySelectorAll ? el.querySelectorAll('img[src*="profile_images"]').length : 0;
-      const hasInputInside = el.querySelector ? Boolean(el.querySelector('textarea, input, [contenteditable="true"]')) : false;
-      if (hasInputInside) continue;
+      const hasUserLink = el.querySelector ? Boolean(el.querySelector('a[href^="/"]')) : false;
+      const role = el.getAttribute ? (el.getAttribute('role') || '').toLowerCase() : '';
+      const ariaLive = el.getAttribute ? el.getAttribute('aria-live') || '' : '';
 
       let score = 0;
       if (scrollable) score += 15;
       if (profileImgs > 0) score += Math.min(12, profileImgs * 4);
+      if (hasUserLink) score += 4;
       if (childCount > 0) score += Math.min(6, childCount);
-      if (rect && rect.height >= 160) score += 5;
-      if (el.getAttribute && el.getAttribute('role') === 'list') score += 8;
+      if (rect && rect.height >= 140) score += 5;
+      else if (allowSmall && rect && rect.height >= 40) score += 4;
+      if (role === 'list' || role === 'log' || ariaLive) score += 10;
 
       // より内側の具体的なリストコンテナを優先（同点なら深い要素）
       if (score > bestScore || (score === bestScore && best && best.contains(el))) {
@@ -249,16 +327,17 @@
       }
     }
 
-    return best && bestScore >= 8 ? { element: best, score: bestScore } : null;
+    return best && bestScore >= minScore ? { element: best, score: bestScore } : null;
   }
 
-  function findChatContainerByInputHeuristic(doc, isDedicated) {
-    if (!doc || typeof doc.querySelectorAll !== 'function') return null;
-
-    const inputs = doc.querySelectorAll(
-      'textarea, input[type="text"], input:not([type]), [contenteditable="true"]'
+  function collectCandidateChatInputs(doc, isDedicated) {
+    if (!doc || typeof doc.querySelectorAll !== 'function') return [];
+    const rawInputs = Array.from(
+      doc.querySelectorAll('textarea, input[type="text"], input:not([type]), [contenteditable="true"]')
     );
-    for (const input of inputs) {
+    const matched = [];
+    for (const input of rawInputs) {
+      if (isHiddenHelperInput(input)) continue;
       const testId = input.getAttribute('data-testid') || '';
       if (testId === 'dmComposerTextInput' || testId === 'SearchBox_Search_Input') {
         continue;
@@ -266,51 +345,175 @@
       if (!isDedicated && testId.startsWith('tweetTextarea')) {
         continue;
       }
-
       const placeholder = input.getAttribute('placeholder') || '';
       const ariaLabel = input.getAttribute('aria-label') || '';
       const combinedHint = `${placeholder} ${ariaLabel}`;
-      if (!CHAT_INPUT_HINT_PATTERN.test(combinedHint) && !isDedicated) {
+      const hasHint = CHAT_INPUT_HINT_PATTERN.test(combinedHint);
+      if (!hasHint && !isDedicated) {
         continue;
       }
-
-      // React Native Web の深いラッパーに対応するため最大14階層まで探索（videoを含む親で即停止）
-      let parent = input.parentElement;
-      for (let depth = 0; depth < 14 && parent; depth += 1) {
-        if (isExcludedContainer(parent)) break;
-        const picked = pickBestChatListInside(parent, input);
-        if (picked) {
-          return { element: picked.element, selector: 'heuristic:input-sibling' };
-        }
-        parent = parent.parentElement;
-      }
+      matched.push({
+        element: input,
+        hasHint,
+        visible: isElementVisible(input),
+      });
     }
-
-    return null;
+    // ヒント一致＆可視の入力欄を優先
+    matched.sort((a, b) => Number(b.visible) - Number(a.visible) || Number(b.hasHint) - Number(a.hasHint));
+    return matched;
   }
 
-  function findChatContainerByChatHeaderHeuristic(doc) {
-    if (!doc || typeof doc.querySelectorAll !== 'function') return null;
-
+  function collectCandidateChatHeaders(doc) {
+    if (!doc || typeof doc.querySelectorAll !== 'function') return [];
     const nodes = doc.querySelectorAll('h1, h2, h3, span, div');
+    const matched = [];
     for (const node of nodes) {
       if (node.children && node.children.length > 0) continue;
       const text = normalizeWhitespace(node.textContent || '');
       if (!text || text.length > 30) continue;
       if (!CHAT_HEADER_PATTERN.test(text)) continue;
+      matched.push({
+        element: node,
+        text,
+        visible: isElementVisible(node),
+      });
+    }
+    matched.sort((a, b) => Number(b.visible) - Number(a.visible));
+    return matched;
+  }
 
-      let parent = node.parentElement;
-      for (let depth = 0; depth < 10 && parent; depth += 1) {
-        if (isExcludedContainer(parent)) break;
-        const picked = pickBestChatListInside(parent, node);
+  function findChatContainerByHeaderAndInputPair(doc, isDedicated) {
+    const inputs = collectCandidateChatInputs(doc, isDedicated);
+    const headers = collectCandidateChatHeaders(doc);
+    if (inputs.length === 0 || headers.length === 0) return null;
+
+    let bestList = null;
+    let bestLcaFallback = null;
+
+    for (const inp of inputs) {
+      for (const hdr of headers) {
+        const lca = findLowestCommonAncestor(inp.element, hdr.element, 20);
+        if (!lca || isStopAncestor(lca)) continue;
+        if (isExcludedContainer(lca)) continue;
+        if (!isElementVisible(lca)) continue;
+
+        const picked = pickBestChatListInside(lca, inp.element, {
+          allowSmall: true,
+          allowLowScore: true,
+          excludeHeader: hdr.element,
+        });
         if (picked) {
-          return { element: picked.element, selector: 'heuristic:chat-header' };
+          const bonus = (inp.hasHint ? 6 : 0) + (inp.visible && hdr.visible ? 4 : 0);
+          const totalScore = picked.score + bonus;
+          if (!bestList || totalScore > bestList.score) {
+            bestList = { element: picked.element, score: totalScore, selector: 'heuristic:header-input-pair' };
+          }
+        } else {
+          // チャット一覧が空・極小・または入力欄と同一スクロール領域内にある場合、
+          // ヘッダと入力欄の共通祖先（video を含まないチャットパネル自体）をフォールバック候補にする
+          const rect = typeof lca.getBoundingClientRect === 'function' ? lca.getBoundingClientRect() : null;
+          const areaOk = !rect || (rect.width >= 140 && rect.height >= 80);
+          if (areaOk) {
+            const area = rect ? rect.width * rect.height : 100000;
+            const bonus = (inp.hasHint ? 1000 : 0) + (inp.visible && hdr.visible ? 500 : 0);
+            // より具体的な（面積が小さい・深い）チャットパネルを優先
+            if (
+              !bestLcaFallback ||
+              bonus > bestLcaFallback.bonus ||
+              (bonus === bestLcaFallback.bonus && area < bestLcaFallback.area)
+            ) {
+              bestLcaFallback = { element: lca, bonus, area, selector: 'heuristic:header-input-lca' };
+            }
+          }
+        }
+      }
+    }
+
+    if (bestList) {
+      return { element: bestList.element, selector: bestList.selector };
+    }
+    if (bestLcaFallback) {
+      return { element: bestLcaFallback.element, selector: bestLcaFallback.selector };
+    }
+    return null;
+  }
+
+  function findChatContainerByInputHeuristic(doc, isDedicated) {
+    const inputs = collectCandidateChatInputs(doc, isDedicated);
+    let best = null;
+
+    for (const item of inputs) {
+      const input = item.element;
+      // React Native Web の深いラッパーに対応するため最大20階層まで探索
+      // video等を含む共通親に到達しても、専用配信ページならその層の「videoを含まない兄弟」を最大2階層だけ確認して打ち切る
+      let parent = input.parentElement;
+      let crossedExcluded = 0;
+      for (let depth = 0; depth < 20 && parent; depth += 1) {
+        if (isStopAncestor(parent)) break;
+        const parentExcluded = isExcludedContainer(parent);
+        if (parentExcluded) {
+          if (!isDedicated) break;
+          crossedExcluded += 1;
+          if (crossedExcluded > 2) break;
+        }
+        const picked = pickBestChatListInside(parent, input, {
+          allowSmall: !parentExcluded && item.hasHint,
+          allowLowScore: !parentExcluded && item.hasHint,
+        });
+        if (picked) {
+          const score = picked.score + (item.hasHint ? 5 : 0) - (parentExcluded ? 4 : 0);
+          if (!best || score > best.score) {
+            best = {
+              element: picked.element,
+              score,
+              selector: parentExcluded ? 'heuristic:input-cross-sibling' : 'heuristic:input-sibling',
+            };
+          }
+          if (!parentExcluded) break;
         }
         parent = parent.parentElement;
       }
     }
 
-    return null;
+    return best ? { element: best.element, selector: best.selector } : null;
+  }
+
+  function findChatContainerByChatHeaderHeuristic(doc, isDedicated) {
+    const headers = collectCandidateChatHeaders(doc);
+    let best = null;
+
+    for (const item of headers) {
+      const node = item.element;
+      let parent = node.parentElement;
+      let crossedExcluded = 0;
+      for (let depth = 0; depth < 18 && parent; depth += 1) {
+        if (isStopAncestor(parent)) break;
+        const parentExcluded = isExcludedContainer(parent);
+        if (parentExcluded) {
+          if (!isDedicated) break;
+          crossedExcluded += 1;
+          if (crossedExcluded > 2) break;
+        }
+        const picked = pickBestChatListInside(parent, node, {
+          allowSmall: !parentExcluded,
+          allowLowScore: !parentExcluded,
+        });
+        if (picked) {
+          const score = picked.score - (parentExcluded ? 4 : 0);
+          if (!best || score > best.score) {
+            best = {
+              element: picked.element,
+              score,
+              selector: parentExcluded ? 'heuristic:header-cross-sibling' : 'heuristic:chat-header',
+            };
+          }
+          if (!parentExcluded) break;
+        }
+        parent = parent.parentElement;
+      }
+    }
+
+    return best ? { element: best.element, selector: best.selector } : null;
   }
 
   function findChatContainer(doc, customContainerSelector, urlString = '') {
@@ -327,7 +530,7 @@
     for (const selector of candidates) {
       try {
         const el = doc.querySelector(selector);
-        if (el && !isExcludedContainer(el)) {
+        if (el && !isExcludedContainer(el) && isElementVisible(el)) {
           return { element: el, selector };
         }
       } catch {
@@ -338,10 +541,13 @@
     const currentUrl = urlString || (doc.location && doc.location.href) || '';
     const isDedicated = isDedicatedBroadcastUrl(currentUrl);
 
+    const byPair = findChatContainerByHeaderAndInputPair(doc, isDedicated);
+    if (byPair) return byPair;
+
     const byInput = findChatContainerByInputHeuristic(doc, isDedicated);
     if (byInput) return byInput;
 
-    const byHeader = findChatContainerByChatHeaderHeuristic(doc);
+    const byHeader = findChatContainerByChatHeaderHeuristic(doc, isDedicated);
     if (byHeader) return byHeader;
 
     return { element: null, selector: '' };
@@ -959,33 +1165,241 @@
     };
   }
 
+  function parseLivePipelinePayload(rawData, options = {}) {
+    const outer = safeJsonParse(rawData);
+    if (!outer || typeof outer !== 'object') return null;
+
+    // まず既存の Chatman 形式としてパース試行
+    const directChatman = parseChatmanPayload(outer, options);
+    if (directChatman) return directChatman;
+
+    const topic = typeof outer.topic === 'string' ? outer.topic : '';
+    const rootPayload = safeJsonParse(outer.payload) || outer.payload || outer;
+    if (!rootPayload || typeof rootPayload !== 'object') return null;
+
+    // Chatman ペイロードが payload 内にネストされているケース
+    const nestedChatman = parseChatmanPayload(rootPayload, options);
+    if (nestedChatman) return nestedChatman;
+
+    // X LivePipeline の各種候補コンテナを探索
+    const msgCandidates = [
+      rootPayload.live_chat_message,
+      rootPayload.liveChatMessage,
+      rootPayload.chat_message,
+      rootPayload.chatMessage,
+      rootPayload.broadcast_chat_message,
+      rootPayload.broadcastChatMessage,
+      rootPayload.message,
+      rootPayload,
+    ].filter((obj) => obj && typeof obj === 'object');
+
+    for (const msg of msgCandidates) {
+      // エンゲージメント更新等の非チャットイベントを除外
+      if (topic && !/chat|broadcast|live|message|comment|space/i.test(topic)) {
+        if (!msg.sender && !msg.author && !msg.user && !msg.user_results) {
+          continue;
+        }
+      }
+
+      const rawText =
+        typeof msg.body === 'string'
+          ? msg.body
+          : typeof msg.text === 'string'
+            ? msg.text
+            : typeof msg.message === 'string'
+              ? msg.message
+              : typeof msg.content === 'string'
+                ? msg.content
+                : '';
+      const commentText = normalizeWhitespace(rawText);
+      if (!commentText) continue;
+
+      const userResult =
+        (msg.user_results && msg.user_results.result) ||
+        (msg.sender_results && msg.sender_results.result) ||
+        (msg.author_results && msg.author_results.result) ||
+        null;
+      const legacy = (userResult && userResult.legacy) || {};
+      const core = (userResult && userResult.core) || {};
+      const sender =
+        (msg.sender && typeof msg.sender === 'object' ? msg.sender : null) ||
+        (msg.author && typeof msg.author === 'object' ? msg.author : null) ||
+        (msg.user && typeof msg.user === 'object' ? msg.user : null) ||
+        {};
+
+      const handle = String(
+        core.screen_name ||
+          legacy.screen_name ||
+          sender.screen_name ||
+          sender.username ||
+          sender.twitter_screen_name ||
+          msg.username ||
+          msg.screen_name ||
+          ''
+      )
+        .replace(/^@/, '')
+        .trim();
+
+      const rawDisplayName = String(
+        core.name ||
+          legacy.name ||
+          sender.display_name ||
+          sender.displayName ||
+          sender.name ||
+          msg.display_name ||
+          msg.displayName ||
+          handle ||
+          ''
+      ).trim();
+
+      if (!rawDisplayName && !handle) continue;
+
+      const nameFormat = options.nameFormat || 'display';
+      const { cleanDisplayName, screenName, formattedName } = buildFormattedName(
+        rawDisplayName,
+        handle,
+        nameFormat
+      );
+
+      const userId = String(
+        handle ||
+          (userResult && userResult.rest_id) ||
+          sender.rest_id ||
+          sender.user_id ||
+          sender.id ||
+          cleanDisplayName
+      ).trim();
+
+      const profileImage = sanitizeHttpUrl(
+        (userResult && userResult.avatar && userResult.avatar.image_url) ||
+          legacy.profile_image_url_https ||
+          sender.profile_image_url_https ||
+          sender.profile_image_url ||
+          sender.profileImageUrl ||
+          sender.avatar_url ||
+          msg.profile_image_url ||
+          ''
+      );
+
+      const now = typeof options.now === 'number' ? options.now : Date.now();
+      const timestamp = normalizeTimestamp(
+        msg.timestamp_ms || msg.timestamp || msg.created_at || outer.timestamp,
+        now
+      );
+
+      const msgId = String(msg.id || msg.uuid || msg.message_id || outer.id || '').trim();
+      const bucket = Math.floor(timestamp / 15000);
+      const id = msgId
+        ? `x_live_lp_${msgId}`
+        : `x_live_lp_${fnv1aHash(`${userId}|${commentText}|${bucket}`)}`;
+
+      const isOwner = Boolean(msg.is_broadcaster || msg.isBroadcaster || sender.is_broadcaster || sender.isOwner);
+      const isSystem = isSystemMessage(commentText);
+
+      return {
+        id,
+        userId,
+        name: formattedName,
+        screenName,
+        comment: commentText,
+        profileImage,
+        timestamp,
+        isOwner,
+        isModerator: Boolean(msg.is_moderator || msg.isModerator || sender.is_moderator),
+        hasGift: false,
+        isSystem,
+        badges: isOwner ? [{ url: '', label: '配信者', type: 'owner' }] : [],
+      };
+    }
+
+    return null;
+  }
+
+  function summarizeElementForDiag(el) {
+    if (!el || el.nodeType !== 1) return null;
+    const rect = typeof el.getBoundingClientRect === 'function' ? el.getBoundingClientRect() : null;
+    let oy = '';
+    if (typeof getComputedStyle === 'function') {
+      try {
+        const st = getComputedStyle(el);
+        oy = st ? st.overflowY || '' : '';
+      } catch {
+        // ignore
+      }
+    }
+    return {
+      tag: el.tagName,
+      testid: el.getAttribute ? el.getAttribute('data-testid') || '' : '',
+      role: el.getAttribute ? el.getAttribute('role') || '' : '',
+      size: rect ? `${Math.round(rect.width)}x${Math.round(rect.height)}` : '',
+      visible: isElementVisible(el),
+      oy,
+      kids: el.children ? el.children.length : 0,
+      hasVideo: Boolean(el.querySelector && el.querySelector('video, [data-testid="videoPlayer"]')),
+      hasTweet: Boolean(el.querySelector && el.querySelector('article[data-testid="tweet"]')),
+      hasInput: hasVisibleInputInside(el),
+      excluded: isExcludedContainer(el),
+    };
+  }
+
+  function traceAncestorsForDiag(el, maxDepth = 10) {
+    const trace = [];
+    let cur = el && el.parentElement;
+    for (let depth = 0; depth < maxDepth && cur; depth += 1) {
+      trace.push({ depth, ...summarizeElementForDiag(cur) });
+      if (isStopAncestor(cur)) break;
+      cur = cur.parentElement;
+    }
+    return trace;
+  }
+
   function collectDomDiagnostics(doc, urlString = '') {
     if (!doc || typeof doc.querySelectorAll !== 'function') return {};
 
-    const inputs = Array.from(
+    const rawInputs = Array.from(
       doc.querySelectorAll('textarea, input[type="text"], input:not([type]), [contenteditable="true"]')
-    )
-      .slice(0, 8)
-      .map((el) => ({
+    ).slice(0, 8);
+
+    const inputs = rawInputs.map((el, idx) => {
+      const rect = typeof el.getBoundingClientRect === 'function' ? el.getBoundingClientRect() : null;
+      const item = {
         tag: el.tagName,
         testid: el.getAttribute('data-testid') || '',
         placeholder: (el.getAttribute('placeholder') || '').slice(0, 40),
         aria: (el.getAttribute('aria-label') || '').slice(0, 40),
-      }));
+        visible: isElementVisible(el),
+        size: rect ? `${Math.round(rect.width)}x${Math.round(rect.height)}` : '',
+      };
+      if (idx < 2) {
+        item.ancestorTrace = traceAncestorsForDiag(el, 10);
+      }
+      return item;
+    });
 
     const chatHeaders = [];
+    const chatHeaderEls = [];
     const nodes = doc.querySelectorAll('h1, h2, h3, span, div');
     for (const node of nodes) {
       if (chatHeaders.length >= 5) break;
       if (node.children && node.children.length > 0) continue;
       const text = normalizeWhitespace(node.textContent || '');
       if (text && text.length <= 30 && CHAT_HEADER_PATTERN.test(text)) {
+        const rect = typeof node.getBoundingClientRect === 'function' ? node.getBoundingClientRect() : null;
         chatHeaders.push({
           tag: node.tagName,
           text,
           testid: node.getAttribute('data-testid') || '',
+          visible: isElementVisible(node),
+          size: rect ? `${Math.round(rect.width)}x${Math.round(rect.height)}` : '',
         });
+        chatHeaderEls.push(node);
       }
+    }
+
+    let lcaCheck = null;
+    if (rawInputs.length > 0 && chatHeaderEls.length > 0) {
+      const lca = findLowestCommonAncestor(rawInputs[0], chatHeaderEls[0], 20);
+      lcaCheck = lca ? summarizeElementForDiag(lca) : { found: false };
     }
 
     const iframes = Array.from(doc.querySelectorAll('iframe'))
@@ -1039,6 +1453,7 @@
     return {
       inputs,
       chatHeaders,
+      lcaCheck,
       iframes,
       containerInfo,
     };
@@ -1051,10 +1466,12 @@
     isUiNoiseText,
     extractTextWithEmoji,
     countProfileImages,
+    hasVisibleInputInside,
     findChatContainer,
     findMessageElements,
     parseChatMessageElement,
     parseChatmanPayload,
+    parseLivePipelinePayload,
     parseHistoryResponse,
     stripAuthorPrefix,
     collectDomDiagnostics,

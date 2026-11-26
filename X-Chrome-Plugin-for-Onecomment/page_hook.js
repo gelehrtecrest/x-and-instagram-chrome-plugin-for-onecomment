@@ -18,7 +18,11 @@
   const seenWsUrls = [];
   const seenEventSourceUrls = [];
   const seenChatNetUrls = [];
+  const seenPipelineTopics = [];
+  const seenSubTopics = [];
+  const seenPipelineSamples = [];
   let historyFetchCount = 0;
+  let pipelineEventCount = 0;
 
   function sanitizeUrl(url) {
     try {
@@ -31,6 +35,11 @@
 
   function pushUniqueLimited(list, value, limit) {
     if (!value || list.includes(value)) return;
+    list.push(value);
+    if (list.length > limit) list.shift();
+  }
+
+  function pushLimited(list, value, limit) {
     list.push(value);
     if (list.length > limit) list.shift();
   }
@@ -48,6 +57,9 @@
     );
   }
 
+  const NOISE_GRAPHQL_RE =
+    /\/(hometimeline|sidebaruserrecommendations|exploresidebar|nflscoressidebarfollow|useroriginalstimeline|profilespotlightsquery|grokaccountjwtquery|usefetchproductsubscriptionsquery|usesubscriptionspaymentfailurequery|iseligibleforvobuttonupsellquery|usersportsprofile|getalttextpromptpreference|pinnedtimelines|usestorytopicquery|viewerbadgecounts|userbyscreenname|usersbyrestids|notification|bookmark|lists?management)/i;
+
   function isInterestingNetUrl(url) {
     if (typeof url !== 'string') return false;
     const lower = url.toLowerCase();
@@ -64,7 +76,8 @@
       lower.includes('/transcoding/') ||
       lower.includes('client_event') ||
       lower.includes('/jot/') ||
-      lower.includes('ces/p2')
+      lower.includes('ces/p2') ||
+      NOISE_GRAPHQL_RE.test(lower)
     ) {
       return false;
     }
@@ -76,9 +89,12 @@
       lower.includes('broadcast') ||
       lower.includes('live_video_stream') ||
       lower.includes('live_pipeline') ||
-      lower.includes('/i/api/graphql/') ||
+      lower.includes('audiospace') ||
+      lower.includes('livechat') ||
+      lower.includes('live_chat') ||
       lower.includes('/chat') ||
-      lower.includes('message')
+      lower.includes('message') ||
+      lower.includes('/i/api/graphql/')
     );
   }
 
@@ -86,6 +102,16 @@
     if (typeof url !== 'string') return false;
     const lower = url.toLowerCase();
     return lower.includes('/chatapi/v1/history') || (lower.includes('/chatapi/') && lower.includes('history'));
+  }
+
+  function isLivePipelineEventsUrl(url) {
+    if (typeof url !== 'string') return false;
+    return url.toLowerCase().includes('/live_pipeline/events');
+  }
+
+  function isLivePipelineSubUrl(url) {
+    if (typeof url !== 'string') return false;
+    return url.toLowerCase().includes('/live_pipeline/update_subscriptions');
   }
 
   function looksLikeChatmanText(text) {
@@ -117,11 +143,141 @@
       connected: activeChatSockets.size > 0,
       activeCount: activeChatSockets.size,
       historyFetchCount,
+      pipelineEventCount,
       seenUrls: [...seenWsUrls],
       seenEventSourceUrls: [...seenEventSourceUrls],
       seenNetUrls: [...seenChatNetUrls],
+      seenPipelineTopics: [...seenPipelineTopics],
+      seenSubTopics: [...seenSubTopics],
+      seenPipelineSamples: [...seenPipelineSamples],
       ...extra,
     });
+  }
+
+  function recordSubTopicsFromBody(body) {
+    try {
+      let text = '';
+      if (typeof body === 'string') {
+        text = body;
+      } else if (typeof URLSearchParams !== 'undefined' && body instanceof URLSearchParams) {
+        text = body.toString();
+      }
+      if (!text) return;
+      const params = new URLSearchParams(text);
+      const subs = params.get('sub_topics') || '';
+      if (subs) {
+        for (const part of subs.split(',')) {
+          const trimmed = part.trim();
+          if (trimmed) pushUniqueLimited(seenSubTopics, trimmed.slice(0, 120), 20);
+        }
+        postStatus();
+      }
+    } catch {
+      // ignore
+    }
+  }
+
+  function handleLivePipelineJsonLine(urlStr, jsonStr) {
+    if (!jsonStr || jsonStr.length > MAX_PAYLOAD_LEN) return;
+    const trimmed = jsonStr.trim();
+    if (!trimmed || trimmed[0] !== '{') return;
+    pipelineEventCount += 1;
+    try {
+      const parsed = JSON.parse(trimmed);
+      const topic = typeof parsed.topic === 'string' ? parsed.topic : '';
+      const prevTopicCount = seenPipelineTopics.length;
+      if (topic) {
+        pushUniqueLimited(seenPipelineTopics, topic.slice(0, 120), 20);
+      }
+      const payloadObj = parsed.payload && typeof parsed.payload === 'object' ? parsed.payload : null;
+      const keys = payloadObj ? Object.keys(payloadObj).slice(0, 8) : Object.keys(parsed).slice(0, 8);
+      const prevSampleCount = seenPipelineSamples.length;
+      if (seenPipelineSamples.length < 8 || /chat|broadcast|live|message|comment|space/i.test(topic)) {
+        pushLimited(
+          seenPipelineSamples,
+          {
+            topic: topic.slice(0, 80),
+            keys,
+          },
+          8
+        );
+      }
+      if (seenPipelineTopics.length !== prevTopicCount || seenPipelineSamples.length !== prevSampleCount) {
+        postStatus();
+      }
+      // チャット・配信系イベント、またはメッセージ構造を持つイベントを content.js に転送
+      if (
+        /chat|broadcast|live|message|comment|space/i.test(topic) ||
+        looksLikeChatmanText(trimmed) ||
+        (payloadObj &&
+          (payloadObj.live_chat_message ||
+            payloadObj.chat_message ||
+            payloadObj.broadcast_chat_message ||
+            payloadObj.message ||
+            payloadObj.body))
+      ) {
+        postHookMessage('LIVE_PIPELINE_EVENT', {
+          url: sanitizeUrl(urlStr),
+          topic,
+          eventCount: pipelineEventCount,
+          data: trimmed,
+        });
+      }
+    } catch {
+      // ignore invalid json line
+    }
+  }
+
+  function readLivePipelineStream(urlStr, response) {
+    try {
+      if (!response || !response.ok || typeof response.clone !== 'function') return;
+      const cloned = response.clone();
+      if (!cloned.body || typeof cloned.body.getReader !== 'function') return;
+      const reader = cloned.body.getReader();
+      const decoder = new TextDecoder('utf-8');
+      let buffer = '';
+
+      const pump = () => {
+        reader
+          .read()
+          .then(({ done, value }) => {
+            if (value) {
+              buffer += decoder.decode(value, { stream: !done });
+              if (buffer.length > MAX_PAYLOAD_LEN * 2) {
+                buffer = buffer.slice(-MAX_PAYLOAD_LEN);
+              }
+              const lines = buffer.split(/\r?\n/);
+              buffer = lines.pop() || '';
+              for (const rawLine of lines) {
+                const line = rawLine.trim();
+                if (!line) continue;
+                if (line.startsWith('data:')) {
+                  handleLivePipelineJsonLine(urlStr, line.slice(5));
+                } else if (line[0] === '{') {
+                  handleLivePipelineJsonLine(urlStr, line);
+                }
+              }
+            }
+            if (!done) {
+              pump();
+            } else if (buffer.trim()) {
+              const tail = buffer.trim();
+              if (tail.startsWith('data:')) {
+                handleLivePipelineJsonLine(urlStr, tail.slice(5));
+              } else if (tail[0] === '{') {
+                handleLivePipelineJsonLine(urlStr, tail);
+              }
+            }
+          })
+          .catch(() => {
+            // stream closed or aborted
+          });
+      };
+
+      pump();
+    } catch {
+      // ignore stream hook error
+    }
   }
 
   function handleHistoryResponseText(urlStr, text) {
@@ -275,7 +431,11 @@
             : '';
 
       if (isInterestingNetUrl(urlStr)) {
-        pushUniqueLimited(seenChatNetUrls, sanitizeUrl(urlStr), 25);
+        pushUniqueLimited(seenChatNetUrls, sanitizeUrl(urlStr), 40);
+      }
+
+      if (isLivePipelineSubUrl(urlStr) && init && init.body) {
+        recordSubTopicsFromBody(init.body);
       }
 
       const promise = NativeFetch.apply(this, arguments);
@@ -291,6 +451,12 @@
               .catch(() => {});
           })
           .catch(() => {});
+      } else if (isLivePipelineEventsUrl(urlStr)) {
+        promise
+          .then((response) => {
+            readLivePipelineStream(urlStr, response);
+          })
+          .catch(() => {});
       }
 
       return promise;
@@ -304,10 +470,13 @@
       return NativeXhrOpen.apply(this, arguments);
     };
 
-    XMLHttpRequest.prototype.send = function patchedSend() {
+    XMLHttpRequest.prototype.send = function patchedSend(body) {
       const urlStr = this.__xLiveHookUrl || '';
       if (isInterestingNetUrl(urlStr)) {
-        pushUniqueLimited(seenChatNetUrls, sanitizeUrl(urlStr), 25);
+        pushUniqueLimited(seenChatNetUrls, sanitizeUrl(urlStr), 40);
+      }
+      if (isLivePipelineSubUrl(urlStr) && body) {
+        recordSubTopicsFromBody(body);
       }
       if (isHistoryApiUrl(urlStr)) {
         this.addEventListener('load', () => {
@@ -330,6 +499,10 @@
       postStatus();
     } else if (event.data.source === CONTENT_SOURCE && event.data.type === 'RESET_NAV') {
       historyFetchCount = 0;
+      pipelineEventCount = 0;
+      seenPipelineTopics.length = 0;
+      seenSubTopics.length = 0;
+      seenPipelineSamples.length = 0;
       postStatus();
     }
   });
